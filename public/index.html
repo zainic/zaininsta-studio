@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#12142b" />
+  <meta name="description" content="Zaininsta Studio — self-hosted Instagram scheduling, publishing, and video downloads." />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/styles.css" />
+  <title>Zaininsta Studio</title>
+</head>
+<body>
+  <svg xmlns="http://www.w3.org/2000/svg" class="svg-sprites" aria-hidden="true">
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+    <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4M17 3v4M3 10h18"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 4v16M4 12h16"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5.5-5.5L5 21"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v4h16v-4"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l-1.8 1.8a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-.99 1.51H8.9a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.81.33l-1.8-1.8A1.65 1.65 0 0 0 4.62 15a1.65 1.65 0 0 0-1.52-1V10a1.65 1.65 0 0 0 1.52-1 1.65 1.65 0 0 0-.33-1.82l1.8-1.8A1.65 1.65 0 0 0 7.9 5.7 1.65 1.65 0 0 0 8.9 4.2h6.2a1.65 1.65 0 0 0 1 1.5 1.65 1.65 0 0 0 1.81-.33l1.8 1.8A1.65 1.65 0 0 0 19.38 9a1.65 1.65 0 0 0 1.52 1v4a1.65 1.65 0 0 0-1.52 1Z"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3 2 21h20L12 3Z"/><path d="M12 9v5M12 17h.01"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M13 5h6v6M19 5l-9 9"/><path d="M19 14v5H5V5h5"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.1 0l3-3a5 5 0 0 0-7.1-7.1l-1.7 1.7M14 11a5 5 0 0 0-7.1 0l-3 3a5 5 0 0 0 7.1 7.1l1.7-1.7"/></symbol>
+    <symbol id="i-trend" viewBox="0 0 24 24"><path d="m3 17 6-6 4 4 8-9M15 6h6v6"/></symbol>
+    <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h4M16 17l5-5-5-5M21 12H9"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 7V4h4v3M6 7l1 14h10l1-14M10 11v6M14 11v6"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.5 9A8 8 0 0 1 19 7l1 5M4 12l1 5a8 8 0 0 0 13.5-2"/></symbol>
+  </svg>
+
+  <div id="login-screen" class="login-screen hidden">
+    <div class="login-orb orb-one"></div><div class="login-orb orb-two"></div>
+    <div class="login-card">
+      <div class="brand-logo login-logo" aria-label="Zaininsta Studio logo"><img src="/favicon.svg" alt="" /></div>
+      <div class="eyebrow light">CREATE. SCHEDULE. PUBLISH.</div>
+      <h1>Welcome to<br><em>Zaininsta Studio.</em></h1>
+      <p>Your all-in-one workspace for Instagram content, scheduling, and media management.</p>
+      <form id="login-form">
+        <label for="admin-password">Admin password</label>
+        <input id="admin-password" type="password" autocomplete="current-password" placeholder="Enter your password" required />
+        <button type="submit" class="btn primary wide" id="login-submit">Enter workspace <svg><use href="#i-arrow"></use></svg></button>
+      </form>
+      <div class="login-foot"><span class="green-pulse"></span> Private, self-hosted workspace</div>
+    </div>
+  </div>
+
+  <div id="app" class="app-shell hidden">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header"><div class="brand-logo" aria-label="Zaininsta Studio logo"><img src="/favicon.svg" alt="" /></div><div class="brand-name">zaininsta<span>STUDIO</span></div></div>
+      <div class="workspace-chip"><span class="workspace-avatar">ZI</span><div><strong>Zaininsta workspace</strong><small>Instagram studio</small></div><span class="chip-chevron">⌄</span></div>
+      <div class="sidebar-label">WORKSPACE</div>
+      <nav class="sidebar-nav" aria-label="Main navigation">
+        <button data-view="overview" class="nav-item active"><svg><use href="#i-grid"></use></svg> Overview</button>
+        <button data-view="compose" class="nav-item"><svg><use href="#i-plus"></use></svg> Create post <span class="nav-plus">+</span></button>
+        <button data-view="calendar" class="nav-item"><svg><use href="#i-calendar"></use></svg> Content planner</button>
+        <button data-view="library" class="nav-item"><svg><use href="#i-image"></use></svg> Media library</button>
+      </nav>
+      <div class="sidebar-label tools-label">TOOLS</div>
+      <nav class="sidebar-nav">
+        <button data-view="downloader" class="nav-item"><svg><use href="#i-download"></use></svg> Video downloader</button>
+        <button data-view="settings" class="nav-item"><svg><use href="#i-settings"></use></svg> Connections</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="sidebar-tip"><span class="tip-icon">✦</span><strong>Create. Schedule. Publish.</strong><p>Plan your content once and let Zaininsta Studio keep the timing on track.</p><button data-view="compose">Create a post <span>↗</span></button></div>
+        <div class="sidebar-user"><div class="user-avatar">ZI</div><div><strong>Zaininsta admin</strong><small>Administrator</small></div><button id="logout-btn" title="Sign out" aria-label="Sign out"><svg><use href="#i-logout"></use></svg></button></div>
+      </div>
+    </aside>
+    <div class="main-area">
+      <header class="topbar"><button class="icon-button mobile-menu" id="menu-btn" aria-label="Toggle navigation"><svg><use href="#i-menu"></use></svg></button><div class="breadcrumb">Zaininsta Studio <span>/</span> <strong id="breadcrumb-current">Overview</strong></div><div class="topbar-right"><div class="top-date" id="today-date"></div><div class="divider-vertical"></div><div class="account-indicator" id="account-indicator"><span class="indicator-dot"></span> Not connected</div><span class="top-avatar">ZI</span></div></header>
+      <main class="main-content">
+        <section id="view-overview" class="view">
+          <div class="page-title-row"><div><div class="eyebrow">ZAININSTA WORKSPACE <span class="mini-star">✳</span></div><h1>Your content. <em>In control.</em></h1><p class="page-sub">Plan your posts, manage your media, and publish with confidence.</p></div><button data-view="compose" class="btn primary new-post-btn"><svg><use href="#i-plus"></use></svg> Create a post</button></div>
+          <div class="stats-grid" id="stats-grid"></div>
+          <div class="overview-grid">
+            <div class="panel chart-panel"><div class="panel-head"><div><h2>Publishing activity</h2><p>Your published content at a glance</p></div><span class="subtle-tag">Last 7 days <span>⌄</span></span></div><div class="chart-wrap" id="activity-chart"></div></div>
+            <div class="panel queue-panel"><div class="panel-head"><div><h2>Up next <span class="panel-asterisk">✳</span></h2><p>Your upcoming scheduled posts</p></div><button data-view="calendar" class="small-link">View all <svg><use href="#i-arrow"></use></svg></button></div><div id="up-next"></div></div>
+          </div>
+          <div class="panel recent-panel"><div class="panel-head"><div><h2>Recent activity</h2><p>All your content, one clear view</p></div><button data-view="calendar" class="small-link">See planner <svg><use href="#i-arrow"></use></svg></button></div><div id="recent-activity"></div></div>
+        </section>
+
+        <section id="view-compose" class="view hidden">
+          <div class="page-title-row"><div><div class="eyebrow">CREATE WITH ZAININSTA</div><h1>Craft your next <em>post.</em></h1><p class="page-sub">Build a post and let Zaininsta Studio handle the timing.</p></div></div>
+          <div class="compose-grid">
+            <div class="panel compose-form-panel">
+              <div class="section-number">01 <span>POST DETAILS</span></div>
+              <form id="compose-form">
+                <div class="field"><label for="post-account">Publish to</label><select id="post-account" required><option value="">Choose an account</option></select></div>
+                <div class="field"><label>Content type</label><div class="segmented"><label><input type="radio" name="post-kind" value="image" checked /><span>▧ &nbsp; Image post</span></label><label><input type="radio" name="post-kind" value="reel" /><span>▷ &nbsp; Reel / Video</span></label></div></div>
+                <div class="field"><label for="post-media">Media URL <span class="field-hint">Public HTTPS</span></label><div class="input-with-icon"><svg><use href="#i-link"></use></svg><input id="post-media" type="url" placeholder="https://your-site.com/content.jpg" required /></div><div class="field-helper">Or <button type="button" id="pick-library" class="inline-action">pick from your media library</button> / <button type="button" id="compose-upload" class="inline-action">upload a file</button>.</div><input id="compose-file" type="file" accept="image/jpeg,video/mp4,video/quicktime" hidden /></div>
+                <div id="library-picker" class="library-picker hidden"></div>
+                <div class="field"><div class="label-between"><label for="post-caption">Caption</label><span id="caption-count">0 / 2,200</span></div><textarea id="post-caption" rows="5" maxlength="2200" placeholder="Tell your story here... ✨"></textarea><div class="field-helper">Use hashtags and a clear call to action.</div></div>
+                <div class="form-separator"></div><div class="section-number">02 <span>PUBLISHING TIME</span></div>
+                <div class="field"><div class="segmented publish-mode"><label><input type="radio" name="post-mode" value="scheduled" checked /><span><svg><use href="#i-clock"></use></svg> Schedule for later</span></label><label><input type="radio" name="post-mode" value="now" /><span>↗ &nbsp; Publish now</span></label></div></div>
+                <div class="field" id="schedule-field"><label for="post-schedule">Date &amp; time <span id="timezone-name" class="field-hint"></span></label><input id="post-schedule" type="datetime-local" required /><div class="field-helper">The server keeps your schedule even when the dashboard is closed.</div></div>
+                <button id="submit-post" type="submit" class="btn primary wide submit-post">Schedule post <svg><use href="#i-arrow"></use></svg></button>
+                <p class="form-disclaimer">Publishing requires a connected Instagram professional account and a Meta-accessible media URL.</p>
+              </form>
+            </div>
+            <aside class="preview-column"><div class="preview-header"><span class="eyebrow">SNEAK PEEK</span><span class="live-pill"><span></span> LIVE PREVIEW</span></div><div class="phone-preview"><div class="preview-account"><div class="preview-avatar">ZI</div><div><strong id="preview-username">your_account</strong><small>Powered by Zaininsta Studio</small></div><span class="preview-dots">•••</span></div><div id="preview-media" class="preview-media"><svg><use href="#i-image"></use></svg><span>Your media will appear here</span></div><div class="preview-actions">♡ <span>☏</span> <span>➤</span><b>♧</b></div><div class="preview-caption"><strong id="preview-account-caption">your_account</strong> <span id="preview-caption">Your story starts here...</span></div><div class="preview-muted">View all comments</div></div><div class="preview-note"><span>✳</span><p>Stay consistent, polished, and always ready to publish.</p></div></aside>
+          </div>
+        </section>
+
+        <section id="view-calendar" class="view hidden"><div class="page-title-row"><div><div class="eyebrow">STAY ONE STEP AHEAD</div><h1>Content <em>planner.</em></h1><p class="page-sub">Every scheduled, published, and past post in one branded workspace.</p></div><button data-view="compose" class="btn primary"><svg><use href="#i-plus"></use></svg> New post</button></div><div class="panel planner-panel"><div class="planner-toolbar"><div class="tab-buttons" id="post-filters"><button class="filter-tab active" data-filter="all">All posts</button><button class="filter-tab" data-filter="scheduled">Scheduled</button><button class="filter-tab" data-filter="published">Published</button><button class="filter-tab" data-filter="failed">Issues</button></div><button id="refresh-posts" class="btn ghost small"><svg><use href="#i-refresh"></use></svg> Refresh</button></div><div id="planner-list"></div></div></section>
+
+        <section id="view-library" class="view hidden"><div class="page-title-row"><div><div class="eyebrow">YOUR CREATIVE ASSETS</div><h1>Media <em>library.</em></h1><p class="page-sub">Upload once, organize beautifully, and schedule whenever inspiration hits.</p></div><label for="library-file" class="btn primary file-button"><svg><use href="#i-plus"></use></svg> Upload media</label><input id="library-file" type="file" accept="image/jpeg,video/mp4,video/quicktime" hidden /></div><div class="upload-zone" id="upload-zone"><div class="upload-icon">↥</div><strong>Bring your content here</strong><p>Drag and drop a JPEG, MP4, or MOV here, or click to browse.</p><span>Maximum 250 MB · Public HTTPS hosting required for publishing</span></div><div class="library-toolbar"><h2>All assets <span id="media-count">0</span></h2><span class="hint">Your uploaded content</span></div><div id="media-list" class="media-grid"></div></section>
+
+        <section id="view-downloader" class="view hidden"><div class="page-title-row"><div><div class="eyebrow">SAVE WHAT INSPIRES</div><h1>Video <em>downloader.</em></h1><p class="page-sub">Save public Instagram videos you are allowed to keep, right from Zaininsta Studio.</p></div></div><div class="download-layout"><div class="panel downloader-panel"><div class="download-hero-icon"><svg><use href="#i-download"></use></svg></div><h2>Paste a link.<br>Get your video.</h2><p>Use a direct link to a public Instagram Reel or video post.</p><form id="download-form"><div class="field"><label for="download-url">Instagram video link</label><div class="input-with-icon"><svg><use href="#i-link"></use></svg><input id="download-url" type="url" required placeholder="https://www.instagram.com/reel/…" /></div></div><label class="consent-line"><input type="checkbox" id="download-rights" required /><span>I own this video or have permission to download it.</span></label><button type="submit" id="download-btn" class="btn primary wide">Start download <svg><use href="#i-arrow"></use></svg></button></form></div><div class="download-info"><div class="info-kicker">GOOD TO KNOW <span>✳</span></div><h3>Simple, secure,<br><em>and intentional.</em></h3><div class="info-rule"></div><div class="info-row"><span>01</span><p>Works with publicly accessible Instagram video posts and Reels.</p></div><div class="info-row"><span>02</span><p>Private, protected, or login-restricted videos aren't supported.</p></div><div class="info-row"><span>03</span><p>Downloads are processed by your server, not by Meta's publishing API.</p></div></div></div><div class="panel download-history"><div class="panel-head"><div><h2>Download history</h2><p>Your recent video downloads</p></div><button id="refresh-downloads" class="btn ghost small"><svg><use href="#i-refresh"></use></svg> Refresh</button></div><div id="downloads-list"></div></div></section>
+
+        <section id="view-settings" class="view hidden"><div class="page-title-row"><div><div class="eyebrow">MAKE THE CONNECTION</div><h1>Zaininsta <em>connections.</em></h1><p class="page-sub">Your Instagram accounts and publishing setup.</p></div></div><div class="settings-grid"><div class="panel settings-panel"><div class="panel-head"><div><h2>Instagram accounts</h2><p>Manage who you're creating for</p></div><a class="btn primary small" id="connect-btn" href="/auth/instagram/start"><svg><use href="#i-plus"></use></svg> Connect Instagram</a></div><div id="account-list"></div></div><div class="panel setup-panel"><div class="eyebrow">SETUP CHECKLIST</div><h2>Ready to publish?</h2><p>Everything you need for automatic publishing.</p><div class="setup-list" id="setup-list"></div><div class="setup-foot">Meta's official publishing API supports Business and Creator accounts. Personal accounts aren't supported.</div></div></div><div class="settings-note"><span>✳</span><div><strong>You're in control of your data.</strong><p>Tokens are encrypted on your server; your browser never receives Instagram access tokens. Run behind HTTPS and back up your data directory securely.</p></div></div></section>
+      </main>
+      <footer class="site-footer"><span>© Zaininsta Studio · Your self-hosted Instagram command center</span><span>Create. Schedule. Publish. ✳</span></footer>
+    </div>
+  </div>
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
