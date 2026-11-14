@@ -1,0 +1,19 @@
+{
+  "name": "zaininsta-studio",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Zaininsta Studio: self-hosted Instagram publishing scheduler and public video downloader",
+  "engines": {
+    "node": ">=20.18.0 <21 || >=22 <23"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "init": "node init.mjs",
+    "dev": "node --watch server.js",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "11.10.0"
+  }
+}
