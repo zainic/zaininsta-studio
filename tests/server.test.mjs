@@ -121,7 +121,7 @@ syncBuiltinESMExports();
   }
 
 
-  await t.test('clear downloads removes saved files and old links; protects active jobs and other files', async () => {
+  await t.test('clear downloads keeps Deleted history, removes files, and protects active jobs and other files', async () => {
     const downloadDir=path.join(tmp,'data','downloads');
     const fixtureDb=new DatabaseSync(path.join(tmp,'data','studio.sqlite'));
     try {
@@ -134,16 +134,30 @@ syncBuiltinESMExports();
       await fs.writeFile(path.join(downloadDir,completed.id+'.mp4.part'),'partial');
       assert.equal((await request(endpoint,'DELETE')).status,200);
       assert.equal((await request(endpoint+'/file')).status,404);
-      assert.equal(fixtureDb.prepare('SELECT id FROM downloads WHERE id=?').get(completed.id),undefined);
+      const archived=fixtureDb.prepare('SELECT * FROM downloads WHERE id=?').get(completed.id);
+      assert.equal(archived.status,'deleted');
+      assert.equal(archived.filename,null);
+      assert.equal(archived.source_url,completed.sourceUrl);
+      assert.equal(archived.created_at,completed.createdAt);
+      assert.equal(archived.source_method,completed.sourceMethod);
+      assert.ok(Number.isFinite(Date.parse(archived.updated_at)));
       assert.equal((await fs.readdir(downloadDir)).some(name=>name.startsWith(completed.id+'.')),false);
       assert.equal(await fs.readFile(path.join(downloadDir,unrelated),'utf8'),'keep');
       assert.equal((await fetch(base+'/media/'+upload.url.split('/').at(-1))).status,200);
-      assert.equal((await request(endpoint,'DELETE')).status,404);
-      assert.equal((await (await request('/api/downloads')).json()).downloads.some(d=>d.id===completed.id),false);
+      assert.equal((await request(endpoint,'DELETE')).status,200);
+      assert.equal(fixtureDb.prepare('SELECT updated_at FROM downloads WHERE id=?').get(completed.id).updated_at,archived.updated_at);
+      const history=(await (await request('/api/downloads')).json()).downloads.find(d=>d.id===completed.id);
+      assert.equal(history.status,'deleted');
+      assert.equal(history.filename,null);
+      assert.equal(history.updatedAt,archived.updated_at);
+      assert.equal((await request(endpoint+'/file','GET',undefined,{Range:'bytes=0-15'})).status,404);
 
       await fs.writeFile(path.join(downloadDir,failedDownload.id+'.mp4.part'),'leftover');
       assert.equal((await request('/api/downloads/'+failedDownload.id,'DELETE')).status,200);
       await assert.rejects(fs.stat(path.join(downloadDir,failedDownload.id+'.mp4.part')),{code:'ENOENT'});
+      const failedHistory=fixtureDb.prepare('SELECT status,last_error FROM downloads WHERE id=?').get(failedDownload.id);
+      assert.equal(failedHistory.status,'deleted');
+      assert.equal(failedHistory.last_error,failedDownload.lastError);
 
       const insert=fixtureDb.prepare('INSERT INTO downloads (id,source_url,status,filename,created_at,updated_at) VALUES (?,?,?,?,?,?)');
       const stamp=new Date().toISOString();
@@ -158,6 +172,7 @@ syncBuiltinESMExports();
       const missingId=crypto.randomUUID();
       insert.run(missingId,'https://www.instagram.com/reel/MISSING/','ready',missingId+'.mp4',stamp,stamp);
       assert.equal((await request('/api/downloads/'+missingId,'DELETE')).status,200);
+      assert.equal(fixtureDb.prepare('SELECT status FROM downloads WHERE id=?').get(missingId).status,'deleted');
       const unsafeId=crypto.randomUUID();
       insert.run(unsafeId,'https://www.instagram.com/reel/UNSAFE/','ready','../uploads/keep.mp4',stamp,stamp);
       assert.equal((await request('/api/downloads/'+unsafeId,'DELETE')).status,400);
@@ -166,7 +181,7 @@ syncBuiltinESMExports();
       insert.run(blockedId,'https://www.instagram.com/reel/BLOCKED/','ready',blockedId+'.mp4',stamp,stamp);
       await fs.mkdir(path.join(downloadDir,blockedId+'.mp4'));
       assert.equal((await request('/api/downloads/'+blockedId,'DELETE')).status,503);
-      assert.ok(fixtureDb.prepare('SELECT id FROM downloads WHERE id=?').get(blockedId));
+      assert.equal(fixtureDb.prepare('SELECT status FROM downloads WHERE id=?').get(blockedId).status,'ready');
     } finally { fixtureDb.close(); }
   });
 

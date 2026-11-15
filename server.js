@@ -479,7 +479,7 @@ function postsList({ limit = 200, status } = {}) {
   if (status && ['scheduled','processing','publishing','published','failed','canceled','needs_review'].includes(status)) return db.prepare(`${postsQuery} WHERE p.status=? ORDER BY p.scheduled_at DESC LIMIT ?`).all(status, limit).map(publicPost);
   return db.prepare(`${postsQuery} ORDER BY p.scheduled_at DESC LIMIT ?`).all(limit).map(publicPost);
 }
-function downloadsList() { return db.prepare('SELECT id, source_url AS sourceUrl, status, filename, last_error AS lastError, created_at AS createdAt, source_method AS sourceMethod FROM downloads ORDER BY created_at DESC LIMIT 40').all(); }
+function downloadsList() { return db.prepare('SELECT id, source_url AS sourceUrl, status, filename, last_error AS lastError, created_at AS createdAt, updated_at AS updatedAt, source_method AS sourceMethod FROM downloads ORDER BY created_at DESC LIMIT 40').all(); }
 const attemptsByIp = new Map();
 function checkLoginAttempts(req) {
   const ip = req.socket.remoteAddress || 'unknown';
@@ -700,6 +700,7 @@ async function handler(req, res) {
     if (clearDownloadMatch && req.method === 'DELETE') {
       const record = db.prepare('SELECT * FROM downloads WHERE id=?').get(clearDownloadMatch[1]);
       failIf(!record, 404, 'Download not found.');
+      if (record.status === 'deleted') return json(res, 200, { ok: true, status: 'deleted', updatedAt: record.updated_at });
       failIf(!['ready', 'failed'].includes(record.status), 409, 'Wait for this download to finish before clearing it.');
       failIf(record.filename && (path.basename(record.filename) !== record.filename || !record.filename.startsWith(record.id + '.')), 400, 'Invalid download file.');
       try {
@@ -713,9 +714,11 @@ async function handler(req, res) {
         console.warn(`[download] clear ${record.id}: ${error.code || 'filesystem error'}`);
         throw new HttpError(503, 'Could not delete the saved files. Try clearing this download again.');
       }
-      // Keep the record if deleting its files failed, so clearing can be retried.
-      db.prepare('DELETE FROM downloads WHERE id=?').run(record.id);
-      return json(res, 200, { ok: true });
+      // Retain the source, original timestamp, method, and errors as history.
+      // The file endpoint only serves ready records, so deleted links stay disabled.
+      const deletedAt = isoNow();
+      db.prepare("UPDATE downloads SET status='deleted', filename=NULL, updated_at=? WHERE id=?").run(deletedAt, record.id);
+      return json(res, 200, { ok: true, status: 'deleted', updatedAt: deletedAt });
     }
     const downloadMatch = route.match(/^\/api\/downloads\/([a-f0-9-]{36})\/file$/);
     if (downloadMatch && req.method === 'GET') {

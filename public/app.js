@@ -117,13 +117,13 @@ function renderDownloads() {
   const downloads = state.downloads;
   const eligible = new Set(downloads.filter(clearableDownload).map(d => d.id));
   for (const id of state.selectedDownloads) if (!eligible.has(id)) state.selectedDownloads.delete(id);
-  $('#downloads-list').innerHTML = downloads.length ? `<div class="table-scroll"><table class="data-table"><thead><tr><th class="download-select-cell"><input type="checkbox" id="select-all-downloads" aria-label="Select all finished downloads" /></th><th>INSTAGRAM LINK</th><th>ADDED</th><th>STATUS</th><th>METHOD</th><th>FILE</th></tr></thead><tbody>${downloads.map(d=>`<tr><td class="download-select-cell"><input type="checkbox" data-select-download="${esc(d.id)}" aria-label="Select download ${esc(d.sourceUrl)}" ${state.selectedDownloads.has(d.id)?'checked':''} ${state.clearingDownloads || !clearableDownload(d)?'disabled':''} /></td><td><div class="download-url-cell" title="${esc(d.sourceUrl)}">${esc(d.sourceUrl)}</div></td><td>${formatShortDate(d.createdAt)}<span class="post-sub">${formatTime(d.createdAt)}</span></td><td><span class="status-pill ${d.status==='ready'?'published':d.status==='failed'?'failed':'processing'}">${esc(capitalize(d.status))}</span>${d.lastError?`<span class="post-sub download-error" title="${esc(d.lastError)}">${esc(d.lastError)}</span>`:''}</td><td><span class="post-sub">${esc(d.sourceMethod==='meta'?'Meta API':d.sourceMethod==='yt-dlp'?'Public extractor':'\u2014')}</span></td><td>${d.status==='ready'?`<a class="mini-action" href="/api/downloads/${esc(d.id)}/file">${icon('download')} Download</a>`:'\u2014'}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty-table"><strong>No downloads yet.</strong>Your downloaded videos will show up here.</div>';
+  $('#downloads-list').innerHTML = downloads.length ? `<div class="table-scroll"><table class="data-table"><thead><tr><th class="download-select-cell"><input type="checkbox" id="select-all-downloads" aria-label="Select all finished downloads" /></th><th>INSTAGRAM LINK</th><th>ADDED</th><th>STATUS</th><th>METHOD</th><th>FILE</th></tr></thead><tbody>${downloads.map(d=>`<tr><td class="download-select-cell"><input type="checkbox" data-select-download="${esc(d.id)}" aria-label="Select download ${esc(d.sourceUrl)}" ${state.selectedDownloads.has(d.id)?'checked':''} ${state.clearingDownloads || !clearableDownload(d)?'disabled':''} /></td><td><div class="download-url-cell" title="${esc(d.sourceUrl)}">${esc(d.sourceUrl)}</div></td><td>${formatShortDate(d.createdAt)}<span class="post-sub">${formatTime(d.createdAt)}</span></td><td><span class="status-pill ${d.status==='ready'?'published':d.status==='failed'?'failed':d.status==='deleted'?'deleted':'processing'}">${esc(capitalize(d.status))}</span>${d.status==='deleted' && d.updatedAt?`<span class="post-sub" title="Deletion time">${formatDate(d.updatedAt)} ${formatTime(d.updatedAt)}</span>`:''}${d.lastError?`<span class="post-sub download-error" title="${esc(d.lastError)}">${esc(d.lastError)}</span>`:''}</td><td><span class="post-sub">${esc(d.sourceMethod==='meta'?'Meta API':d.sourceMethod==='yt-dlp'?'Public extractor':'\u2014')}</span></td><td>${d.status==='ready'?`<a class="mini-action" href="/api/downloads/${esc(d.id)}/file">${icon('download')} Download</a>`:d.status==='deleted'?'<span class="post-sub">File deleted</span>':'\u2014'}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty-table"><strong>No downloads yet.</strong>Your downloaded videos will show up here.</div>';
   updateDownloadSelection();
 }
 async function clearSelectedDownloads() {
   if (state.clearingDownloads) return;
   const ids = state.downloads.filter(d => clearableDownload(d) && state.selectedDownloads.has(d.id)).map(d => d.id);
-  if (!ids.length || !confirm(`Clear ${ids.length} selected download${ids.length === 1 ? '' : 's'}? Saved video files will be permanently deleted and their download links will stop working.`)) return;
+  if (!ids.length || !confirm(`Clear ${ids.length} selected download${ids.length === 1 ? '' : 's'}? Saved video files will be permanently deleted and their download links will stop working. History entries will remain with a Deleted status.`)) return;
   state.clearingDownloads = true;
   renderDownloads();
   let cleared = 0;
@@ -131,9 +131,9 @@ async function clearSelectedDownloads() {
   try {
     for (const id of ids) {
       try {
-        await api('/api/downloads/' + id, 'DELETE');
+        const result = await api('/api/downloads/' + id, 'DELETE');
         state.selectedDownloads.delete(id);
-        state.downloads = state.downloads.filter(d => d.id !== id);
+        state.downloads = state.downloads.map(d => d.id === id ? { ...d, status: 'deleted', filename: null, updatedAt: result.updatedAt } : d);
         cleared++;
       } catch (error) { errors.push(error.message); }
     }
