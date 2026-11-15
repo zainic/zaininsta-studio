@@ -32,6 +32,8 @@ test('self-hosted dashboard API: login, upload, schedule, cancel and disconnect'
   await fs.copyFile(path.join(root,'server.js'),path.join(tmp,'server.js'));
   await fs.copyFile(path.join(root,'sqlite-driver.mjs'),path.join(tmp,'sqlite-driver.mjs'));
   await fs.copyFile(path.join(root,'download-helper.mjs'),path.join(tmp,'download-helper.mjs'));
+  await fs.copyFile(path.join(root,'video-editor.mjs'),path.join(tmp,'video-editor.mjs'));
+  await fs.copyFile(path.join(root,'render-resources.mjs'),path.join(tmp,'render-resources.mjs'));
   // Native dependencies are installed at the project root; the isolated
   // test server needs access to the same installation on Node.js 20.
   try { await fs.symlink(path.join(root,'node_modules'),path.join(tmp,'node_modules'),process.platform === 'win32' ? 'junction' : 'dir'); } catch (error) { if (error.code !== 'ENOENT' && error.code !== 'EEXIST') throw error; }

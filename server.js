@@ -9,13 +9,16 @@ import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
 import { spawn } from 'node:child_process';
 import { classifyExtractorFailure, findOwnedVideo, streamOwnedVideo, finalizedExtractorFile, redactDownloaderDiagnostic } from './download-helper.mjs';
+import { EditValidationError, validateEdit, buildRenderArgs, probeVideo, runProcess } from './video-editor.mjs';
+import { getRenderResources, evaluateRenderResources, humanRenderFailure } from './render-resources.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DATA = path.join(ROOT, 'data');
 const UPLOAD_DIR = path.join(DATA, 'uploads');
 const DOWNLOAD_DIR = path.join(DATA, 'downloads');
+const EDIT_DIR = path.join(DATA, 'edits');
 const PUBLIC = path.join(ROOT, 'public');
-for (const d of [DATA, UPLOAD_DIR, DOWNLOAD_DIR]) fs.mkdirSync(d, { recursive: true });
+for (const d of [DATA, UPLOAD_DIR, DOWNLOAD_DIR, EDIT_DIR]) fs.mkdirSync(d, { recursive: true });
 
 // Small dependency-free .env parser; values may be quoted.
 try {
@@ -42,6 +45,7 @@ const UNIFIED_CONFIGURED = !!(env.META_APP_ID && env.META_APP_SECRET && env.META
 const LEGACY_CONFIGURED = !!(env.INSTAGRAM_APP_ID && env.INSTAGRAM_APP_SECRET && env.INSTAGRAM_REDIRECT_URI);
 const MAX_UPLOAD = 250 * 1024 * 1024;
 const MAX_DOWNLOAD = 250 * 1024 * 1024;
+const MAX_AUDIO_UPLOAD = 25 * 1024 * 1024;
 const YT_DLP = env.YT_DLP_BIN || 'yt-dlp';
 const SESSION_TTL = 8 * 60 * 60 * 1000;
 const now = () => Date.now();
@@ -95,6 +99,11 @@ db.exec(`
     id TEXT PRIMARY KEY, source_url TEXT NOT NULL, status TEXT NOT NULL,
     filename TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS video_edits (
+    id TEXT PRIMARY KEY, source_media_id TEXT NOT NULL, overlay_media_id TEXT, music_media_id TEXT,
+    status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, result_media_id TEXT,
+    last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS sessions (hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS oauth_states (state TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
 `);
@@ -114,6 +123,7 @@ addColumnIfMissing('downloads', 'source_method', "TEXT");
 // An interrupted publish request could already have succeeded. Never auto-retry those.
 db.prepare("UPDATE posts SET status='scheduled', updated_at=? WHERE status='processing'").run(isoNow());
 db.prepare("UPDATE posts SET status='needs_review', last_error='Server restarted during publication. Check Instagram manually; do not blindly retry.', updated_at=? WHERE status='publishing'").run(isoNow());
+db.prepare("UPDATE video_edits SET status='failed', last_error='Rendering stopped after a server restart or resource limit. Check Railway logs and use 480p or local rendering.', updated_at=? WHERE status IN ('queued','rendering')").run(isoNow());
 db.prepare("UPDATE downloads SET status='failed', last_error='Download interrupted by a restart. Please try again.', updated_at=? WHERE status IN ('queued','downloading')").run(isoNow());
 
 class HttpError extends Error { constructor(code, message) { super(message); this.code = code; } }
@@ -452,7 +462,7 @@ async function runDownloader(id, url) {
     console.warn(`[download] ${id}: ${e.message}`);
   } finally { activeDownloads--; }
 }
-const contentTypes = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.mkv': 'video/x-matroska' };
+const contentTypes = { '.png':'image/png', '.mp3':'audio/mpeg', '.m4a':'audio/mp4', '.wav':'audio/wav', '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.mkv': 'video/x-matroska' };
 async function serveFile(req, res, file, { attachment = false, publicFile = false } = {}) {
   const st = await fsp.stat(file).catch(() => null);
   if (!st?.isFile()) throw new HttpError(404, 'File not found.');
@@ -488,6 +498,82 @@ function checkLoginAttempts(req) {
   if (record.count >= 8) throw new HttpError(429, 'Too many attempts. Try again in 10 minutes.');
   return { ip, record };
 }
+
+function lookupEditableMedia(id, allowed, label) {
+  if (!/^[a-f0-9-]{36}$/.test(String(id || ''))) throw new HttpError(400, `Select a valid uploaded ${label}.`);
+  const record = db.prepare('SELECT * FROM media WHERE id=?').get(id);
+  if (!record || !allowed.includes(record.mime)) throw new HttpError(400, `Select ${label} from your uploaded Media Library.`);
+  return record;
+}
+function publicMedia(record) {
+  return { id:record.id, name:record.original_name, size:record.size, mime:record.mime,
+    url:`${PUBLIC_BASE}/media/${record.filename}`, createdAt:record.created_at };
+}
+async function prepareVideoEdit(body) {
+  const source=lookupEditableMedia(body.mediaId,['video/mp4','video/quicktime'],'video');
+  const overlay=body.overlayMediaId?lookupEditableMedia(body.overlayMediaId,['image/jpeg','image/png'],'overlay image'):null;
+  const music=body.musicMediaId?lookupEditableMedia(body.musicMediaId,['audio/mpeg','audio/mp4','audio/wav','audio/x-wav'],'audio track'):null;
+  let metadata;
+  try { metadata=await probeVideo(path.join(UPLOAD_DIR,source.filename)); }
+  catch(error) { throw new HttpError(422,String(error.message).slice(0,240)); }
+  let settings;
+  try { settings=validateEdit(body.settings,metadata); }
+  catch(error) { if(error instanceof EditValidationError)throw new HttpError(400,error.message);throw error; }
+  return {source,overlay,music,settings,metadata};
+}
+const activeEditJobs = new Set();
+let editRequestPending = false;
+async function renderVideoEdit(id, source, overlay, music, settings, metadata, threads=2) {
+  const sourcePath=path.join(UPLOAD_DIR,source.filename);
+  const outputId=crypto.randomUUID(), outputName=`${outputId}.mp4`;
+  const outputPath=path.join(UPLOAD_DIR,outputName);
+  const textFile=path.join(EDIT_DIR,`${id}.txt`);
+  activeEditJobs.add(id);
+  try {
+    db.prepare("UPDATE video_edits SET status='rendering',progress=1,updated_at=? WHERE id=?").run(isoNow(),id);
+    if(settings.text) await fsp.writeFile(textFile,settings.text,'utf8');
+    const {args,outputDuration}=buildRenderArgs({sourcePath,outputPath,settings,metadata,
+      overlayPath:overlay&&path.join(UPLOAD_DIR,overlay.filename),
+      musicPath:music&&path.join(UPLOAD_DIR,music.filename),textPath:settings.text?textFile:null,threads});
+    let stdoutBuffer='',lastPercent=0;
+    const progressUpdater = text => {
+      stdoutBuffer=(stdoutBuffer+text).slice(-1000);
+      const lines=stdoutBuffer.split(/\r?\n/);stdoutBuffer=lines.pop();
+      for(const line of lines){
+        const m=/^out_time_(?:ms|us)=(\d+)/.exec(line);
+        if(!m)continue;
+        const percent=Math.min(99,Math.floor(Number(m[1])/1e6/outputDuration*100));
+        if(percent>=lastPercent+4){lastPercent=percent;db.prepare('UPDATE video_edits SET progress=?,updated_at=? WHERE id=?').run(percent,isoNow(),id);}
+      }
+    };
+    await runProcess('ffmpeg',args,{timeoutMs:8*60_000,onStdout:progressUpdater});
+    const stat=await fsp.stat(outputPath);
+    if(!stat.size || stat.size>MAX_UPLOAD)throw new Error('Rendered video exceeds the 250 MB media limit. Reduce the duration or quality.');
+    const t=isoNow();
+    const mediaName=`zaininsta-edited-${new Date().toISOString().slice(0,10)}.mp4`;
+    db.prepare('INSERT INTO media (id,filename,original_name,mime,size,created_at) VALUES (?,?,?,?,?,?)')
+      .run(outputId,outputName,mediaName,'video/mp4',stat.size,t);
+    db.prepare("UPDATE video_edits SET status='ready',progress=100,result_media_id=?,last_error=NULL,updated_at=? WHERE id=?")
+      .run(outputId,t,id);
+    console.info(`[editor] ${id} rendered ${stat.size} bytes`);
+  }catch(error){
+    await fsp.rm(outputPath,{force:true}).catch(()=>{});
+    const reason=humanRenderFailure(error.message||'Video rendering failed');
+    db.prepare("UPDATE video_edits SET status='failed',last_error=?,updated_at=? WHERE id=?")
+      .run(reason,isoNow(),id);
+    console.warn(`[editor] ${id} failed: ${reason}`);
+  }finally{
+    await fsp.rm(textFile,{force:true}).catch(()=>{});
+    activeEditJobs.delete(id);
+  }
+}
+function editJobView(id) {
+  const e=db.prepare('SELECT * FROM video_edits WHERE id=?').get(id);
+  if(!e)throw new HttpError(404,'Video edit job not found.');
+  const media=e.result_media_id&&db.prepare('SELECT * FROM media WHERE id=?').get(e.result_media_id);
+  return {id:e.id,status:e.status,progress:e.progress,lastError:e.last_error,media:media?publicMedia(media):null};
+}
+
 function stats() {
   const counts = Object.fromEntries(db.prepare('SELECT status, COUNT(*) AS n FROM posts GROUP BY status').all().map(r => [r.status, r.n]));
   const recent = postsList({ limit: 8 });
@@ -534,7 +620,7 @@ async function handler(req, res) {
   }
   if (route.startsWith('/media/') && ['GET','HEAD'].includes(req.method)) {
     const name = route.slice('/media/'.length);
-    failIf(!/^[a-f0-9-]{36}\.(jpg|jpeg|mp4|mov)$/.test(name), 404, 'Media not found.');
+    failIf(!/^[a-f0-9-]{36}\.(jpg|jpeg|png|mp4|mov|mp3|m4a|wav)$/.test(name), 404, 'Media not found.');
     return serveFile(req, res, path.join(UPLOAD_DIR, name), { publicFile: true });
   }
   if (route === '/auth/instagram/callback' && req.method === 'GET') {
@@ -645,15 +731,15 @@ async function handler(req, res) {
       return json(res, 200, { ok: true });
     }
     if (route === '/api/media' && req.method === 'GET') {
-      const files = db.prepare('SELECT * FROM media ORDER BY created_at DESC LIMIT 100').all().map(m => ({ id: m.id, name: m.original_name, size: m.size, mime: m.mime, url: `${PUBLIC_BASE}/media/${m.filename}`, createdAt: m.created_at }));
+      const files = db.prepare('SELECT * FROM media ORDER BY created_at DESC LIMIT 100').all().map(publicMedia);
       return json(res, 200, { media: files });
     }
     if (route === '/api/upload' && req.method === 'PUT') {
       const type = String(req.headers['content-type'] || '').split(';')[0].toLowerCase();
-      const extByType = { 'image/jpeg': '.jpg', 'video/mp4': '.mp4', 'video/quicktime': '.mov' };
-      failIf(!extByType[type], 415, 'Only JPEG images, MP4 videos, and MOV videos are allowed.');
+      const extByType = { 'image/png': '.png', 'image/jpeg': '.jpg', 'video/mp4': '.mp4', 'video/quicktime': '.mov', 'audio/mpeg': '.mp3', 'audio/mp4': '.m4a', 'audio/wav': '.wav', 'audio/x-wav': '.wav' };
+      failIf(!extByType[type], 415, 'Upload JPEG, PNG, MP4, MOV, MP3, M4A, or WAV files.');
       const len = Number(req.headers['content-length']);
-      failIf(!Number.isFinite(len) || len <= 0 || len > MAX_UPLOAD, 413, 'File must be 1 byte to 250 MB.');
+      failIf(!Number.isFinite(len) || len <= 0 || len > (type.startsWith('audio/') ? MAX_AUDIO_UPLOAD : MAX_UPLOAD), 413, 'Videos must be 250 MB or smaller; audio must be 25 MB or smaller.');
       let name;
       try { name = decodeURIComponent(String(req.headers['x-filename'] || 'upload')).slice(0, 150); }
       catch { name = 'upload'; }
@@ -669,11 +755,48 @@ async function handler(req, res) {
         const first = Buffer.alloc(16); await handle.read(first, 0, 16, 0); await handle.close();
         const jpeg = first[0] === 0xff && first[1] === 0xd8 && first[2] === 0xff;
         const isoVideo = first.toString('ascii', 4, 8) === 'ftyp';
-        failIf(type === 'image/jpeg' ? !jpeg : !isoVideo, 415, 'File content does not match its selected format.');
+        const png = first.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]));
+        const mp3 = first.toString('ascii',0,3) === 'ID3' || (first[0] === 0xff && (first[1] & 0xe0) === 0xe0);
+        const wav = first.toString('ascii',0,4) === 'RIFF' && first.toString('ascii',8,12) === 'WAVE';
+        const isValid = type==='image/jpeg'?jpeg:type==='image/png'?png:type==='audio/mpeg'?mp3:type==='audio/wav'||type==='audio/x-wav'?wav:isoVideo;
+        failIf(!isValid, 415, 'File content does not match its selected format.');
         db.prepare('INSERT INTO media (id,filename,original_name,mime,size,created_at) VALUES (?,?,?,?,?,?)').run(id, filename, name, type, count, isoNow());
         return json(res, 201, { media: { id, name, size: count, mime: type, url: `${PUBLIC_BASE}/media/${filename}` } });
       } catch (e) { await fsp.rm(fullPath, { force: true }).catch(() => {}); throw e; }
     }
+    if (route === '/api/editor/probe' && req.method === 'POST') {
+      const body=await bodyJson(req);
+      const source=lookupEditableMedia(body.mediaId,['video/mp4','video/quicktime'],'video');
+      const metadata=await probeVideo(path.join(UPLOAD_DIR,source.filename)).catch(error=>{
+        throw new HttpError(422, String(error.message).slice(0,220));
+      });
+      return json(res,200,{media:publicMedia(source),metadata});
+    }
+    if (route === '/api/editor/preflight' && req.method === 'POST') {
+      const body=await bodyJson(req,12_000);
+      const selection=await prepareVideoEdit(body);
+      const assessment=evaluateRenderResources(selection.settings,await getRenderResources(UPLOAD_DIR));
+      return json(res,200,{assessment});
+    }
+    if (route === '/api/editor/render' && req.method === 'POST') {
+      if(editRequestPending || activeEditJobs.size || db.prepare("SELECT COUNT(*) AS n FROM video_edits WHERE status IN ('queued','rendering')").get().n)
+        throw new HttpError(429,'Another video render is in progress. Wait for it to finish.');
+      editRequestPending = true;
+      try {
+        const body=await bodyJson(req,12_000);
+        const {source,overlay,music,settings,metadata}=await prepareVideoEdit(body);
+        const assessment=evaluateRenderResources(settings,await getRenderResources(UPLOAD_DIR));
+        if(!assessment.ok)throw new HttpError(422,'Server rendering blocked: '+assessment.errors.join(' '));
+        const threads=assessment.resources.memoryLimitMB!==null && assessment.resources.memoryLimitMB<=1024?1:2;
+        const id=crypto.randomUUID(),t=isoNow();
+        db.prepare(`INSERT INTO video_edits (id,source_media_id,overlay_media_id,music_media_id,status,created_at,updated_at)
+          VALUES (?,?,?,?,'queued',?,?)`).run(id,source.id,overlay?.id||null,music?.id||null,t,t);
+        void renderVideoEdit(id,source,overlay,music,settings,metadata,threads);
+        return json(res,202,{job:editJobView(id),warnings:assessment.warnings});
+      } finally { editRequestPending = false; }
+    }
+    const editMatch=route.match(/^\/api\/editor\/jobs\/([a-f0-9-]{36})$/);
+    if(editMatch && req.method==='GET') return json(res,200,{job:editJobView(editMatch[1])});
     const mediaMatch = route.match(/^\/api\/media\/([a-f0-9-]{36})$/);
     if (mediaMatch && req.method === 'DELETE') {
       const record = db.prepare('SELECT * FROM media WHERE id=?').get(mediaMatch[1]);
@@ -681,6 +804,8 @@ async function handler(req, res) {
       const fullURL = `${PUBLIC_BASE}/media/${record.filename}`;
       const dependent = db.prepare("SELECT COUNT(*) AS n FROM posts WHERE media_url=? AND status IN ('scheduled','processing','publishing')").get(fullURL).n;
       failIf(dependent > 0, 409, 'This file is used by an active scheduled post.');
+      const usedInEditor=db.prepare("SELECT COUNT(*) AS n FROM video_edits WHERE status IN ('queued','rendering') AND (source_media_id=? OR overlay_media_id=? OR music_media_id=?)").get(record.id,record.id,record.id).n;
+      failIf(usedInEditor>0,409,'This file is in use by an active video render.');
       db.prepare('DELETE FROM media WHERE id=?').run(mediaMatch[1]);
       await fsp.rm(path.join(UPLOAD_DIR, record.filename), { force: true });
       return json(res, 200, { ok: true });
