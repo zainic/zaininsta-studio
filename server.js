@@ -32,7 +32,13 @@ const env = process.env;
 const PORT = Number(env.PORT || 3000);
 const BASE = (env.APP_BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const PUBLIC_BASE = (env.PUBLIC_BASE_URL || BASE).replace(/\/$/, '');
-const GRAPH = `https://graph.instagram.com/${/^v\d+\.\d+$/.test(env.GRAPH_VERSION || '') ? env.GRAPH_VERSION : 'v27.0'}`;
+const GRAPH_VERSION = /^v\d+\.\d+$/.test(env.GRAPH_VERSION || '') ? env.GRAPH_VERSION : 'v27.0';
+const LEGACY_GRAPH = `https://graph.instagram.com/${GRAPH_VERSION}`;
+// Test-only origin override. Production is always pinned to Meta.
+const META_GRAPH_ORIGIN = env.NODE_ENV === 'test' && env.META_GRAPH_ORIGIN ? env.META_GRAPH_ORIGIN.replace(/\/$/, '') : 'https://graph.facebook.com';
+const UNIFIED_GRAPH = `${META_GRAPH_ORIGIN}/${GRAPH_VERSION}`;
+const UNIFIED_CONFIGURED = !!(env.META_APP_ID && env.META_APP_SECRET && env.META_CONFIG_ID && env.INSTAGRAM_REDIRECT_URI);
+const LEGACY_CONFIGURED = !!(env.INSTAGRAM_APP_ID && env.INSTAGRAM_APP_SECRET && env.INSTAGRAM_REDIRECT_URI);
 const MAX_UPLOAD = 250 * 1024 * 1024;
 const MAX_DOWNLOAD = 250 * 1024 * 1024;
 const YT_DLP = env.YT_DLP_BIN || 'yt-dlp';
@@ -91,6 +97,18 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS sessions (hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS oauth_states (state TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
 `);
+// Non-destructive migration: pre-Unified Login installations retain their existing
+// accounts and scheduled posts. Existing accounts keep the legacy token semantics.
+function addColumnIfMissing(table, column, definition) {
+  if (!db.prepare(`PRAGMA table_info(${table})`).all().some(row => row.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+addColumnIfMissing('accounts', 'auth_type', "TEXT NOT NULL DEFAULT 'instagram_login'");
+addColumnIfMissing('accounts', 'client_business_id', 'TEXT');
+addColumnIfMissing('accounts', 'meta_config_id', 'TEXT');
+addColumnIfMissing('oauth_states', 'session_hash', 'TEXT');
+addColumnIfMissing('oauth_states', 'flow', "TEXT NOT NULL DEFAULT 'legacy'");
 // An interrupted publish request could already have succeeded. Never auto-retry those.
 db.prepare("UPDATE posts SET status='scheduled', updated_at=? WHERE status='processing'").run(isoNow());
 db.prepare("UPDATE posts SET status='needs_review', last_error='Server restarted during publication. Check Instagram manually; do not blindly retry.', updated_at=? WHERE status='publishing'").run(isoNow());
@@ -142,7 +160,7 @@ async function bodyJson(req, limit = 40_000) {
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); }
   catch { throw new HttpError(400, 'Invalid JSON.'); }
 }
-const publicAccount = a => ({ id: a.id, username: a.username, accountType: a.account_type || 'Professional', tokenExpiresAt: a.token_expires_at });
+const publicAccount = a => ({ id: a.id, username: a.username, accountType: a.account_type || 'Professional', authType: a.auth_type || 'instagram_login', tokenExpiresAt: a.token_expires_at });
 const publicPost = p => ({ id: p.id, accountId: p.account_id, username: p.username, kind: p.kind, mediaUrl: p.media_url, caption: p.caption, scheduledAt: p.scheduled_at, status: p.status, permalink: p.permalink, publishedMediaId: p.published_media_id, lastError: p.last_error, createdAt: p.created_at });
 const postsQuery = `SELECT p.*, a.username FROM posts p LEFT JOIN accounts a ON a.id=p.account_id`;
 function assertMediaUrl(input) {
@@ -165,18 +183,25 @@ function metaError(payload, responseStatus) {
   return String(detail).slice(0, 700);
 }
 async function metaRequest(url, { method = 'GET', params = {}, token, timeout = 35_000 } = {}) {
-  let target = new URL(url);
-  let data = new URLSearchParams({ ...params, access_token: token });
+  const target = new URL(url);
+  // Graph Facebook supports Authorization headers. Keep Unified Login tokens
+  // out of query strings and application/proxy request logs.
+  const unifiedHost = target.origin === new URL(UNIFIED_GRAPH).origin;
+  const data = new URLSearchParams(unifiedHost ? params : { ...params, access_token: token });
   const options = { method, signal: AbortSignal.timeout(timeout) };
+  if (unifiedHost) options.headers = { Authorization: `Bearer ${token}` };
   if (method === 'GET') target.search = data.toString();
-  else { options.body = data; options.headers = { 'Content-Type': 'application/x-www-form-urlencoded' }; }
+  else {
+    options.body = data;
+    options.headers = { ...options.headers, 'Content-Type': 'application/x-www-form-urlencoded' };
+  }
   const response = await fetch(target, options);
   const raw = await response.text();
   let result = {}; try { result = JSON.parse(raw); } catch { /* A gateway may return plain text */ }
   if (!response.ok || result.error) throw new Error(metaError(result, response.status));
   return result;
 }
-async function getProfile(token) { return metaRequest(`${GRAPH}/me`, { params: { fields: 'id,user_id,username,account_type' }, token }); }
+async function getProfile(token) { return metaRequest(`${LEGACY_GRAPH}/me`, { params: { fields: 'id,user_id,username,account_type' }, token }); }
 async function exchangeOAuthCode(code) {
   const params = new FormData();
   for (const [key, value] of Object.entries({ client_id: env.INSTAGRAM_APP_ID, client_secret: env.INSTAGRAM_APP_SECRET, grant_type: 'authorization_code', redirect_uri: env.INSTAGRAM_REDIRECT_URI, code })) params.set(key, value);
@@ -188,6 +213,65 @@ async function exchangeOAuthCode(code) {
   const long = await metaRequest('https://graph.instagram.com/access_token', { params: { grant_type: 'ig_exchange_token', client_secret: env.INSTAGRAM_APP_SECRET }, token: short.access_token });
   return { short, long };
 }
+// Unified Login issues a Business Integration System User access token (SUAT).
+// Unlike legacy Instagram Login tokens, it must not be sent to ig_refresh_token.
+async function exchangeUnifiedCode(code) {
+  const url = new URL(`${UNIFIED_GRAPH}/oauth/access_token`);
+  url.search = new URLSearchParams({ client_id: env.META_APP_ID, client_secret: env.META_APP_SECRET,
+    redirect_uri: env.INSTAGRAM_REDIRECT_URI, code }).toString();
+  const response = await fetch(url, { signal: AbortSignal.timeout(35_000) });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.error || !data.access_token) {
+    throw new Error(`Unified Login token exchange failed: ${metaError(data, response.status)}`);
+  }
+  return data;
+}
+async function assignedInstagramAccounts(token) {
+  const accounts = [];
+  let after = null;
+  const seen = new Set();
+  for (let page = 0; page < 10; page++) {
+    const params = { fields: 'id,username', limit: '100' };
+    if (after) params.after = after;
+    const result = await metaRequest(`${UNIFIED_GRAPH}/me/assigned_instagram_accounts`, { token, params });
+    if (!Array.isArray(result.data)) throw new Error('Meta did not return an Instagram account list.');
+    for (const a of result.data) {
+      if (/^\d+$/.test(String(a.id || '')) && typeof a.username === 'string' && a.username.trim()) {
+        if (!accounts.some(item => item.id === String(a.id))) accounts.push({ id: String(a.id), username: a.username.trim() });
+      }
+    }
+    const cursor = result.paging?.cursors?.after;
+    if (!result.paging?.next || !cursor || seen.has(cursor)) break;
+    seen.add(cursor);
+    after = cursor;
+  }
+  return accounts;
+}
+async function connectUnifiedAccounts(code) {
+  const exchanged = await exchangeUnifiedCode(code);
+  const token = exchanged.access_token;
+  // Business ID is kept for potential future SUAT management/rotation.
+  const business = await metaRequest(`${UNIFIED_GRAPH}/me`, { token, params: { fields: 'client_business_id' } });
+  const accounts = await assignedInstagramAccounts(token);
+  if (!accounts.length) throw new Error('No Instagram professional accounts were shared. Select an Instagram asset in Meta Business Login, then reconnect.');
+  // A missing expiration is not assumed to be a 60-day Instagram token. It
+  // means Meta did not return an expiration. Reconnect if the SUAT is revoked.
+  const seconds = Number(exchanged.expires_in);
+  const expiry = Number.isFinite(seconds) && seconds > 0 ? new Date(now() + seconds * 1000).toISOString() : null;
+  const clientBusinessId = business.client_business_id ? String(business.client_business_id) : null;
+  const t = isoNow();
+  const upsert = db.prepare(`INSERT INTO accounts
+    (id, username, account_type, token_ciphertext, token_expires_at, auth_type, client_business_id, meta_config_id, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(id) DO UPDATE SET username=excluded.username, account_type=excluded.account_type,
+      token_ciphertext=excluded.token_ciphertext, token_expires_at=excluded.token_expires_at,
+      auth_type=excluded.auth_type, client_business_id=excluded.client_business_id,
+      meta_config_id=excluded.meta_config_id, updated_at=excluded.updated_at`);
+  // On an existing account, preserve outstanding scheduled posts (same IG id).
+  for (const a of accounts) upsert.run(a.id, a.username, 'Professional', protect(token), expiry,
+    'unified', clientBusinessId, env.META_CONFIG_ID, t, t);
+  return accounts;
+}
 async function refreshAccount(account) {
   const token = reveal(account.token_ciphertext);
   const refreshed = await metaRequest('https://graph.instagram.com/refresh_access_token', { params: { grant_type: 'ig_refresh_token' }, token });
@@ -198,7 +282,9 @@ async function refreshAccount(account) {
 async function accountToken(account) {
   const expiry = account.token_expires_at ? new Date(account.token_expires_at).getTime() : 0;
   if (expiry && expiry < now()) throw new Error('Instagram token expired. Reconnect the account in Settings.');
-  // Instagram long-lived tokens should be refreshed before expiry, but after their first 24h.
+  // Unified Login SUAT rotation uses a separate Meta management API, not ig_refresh_token.
+  if (account.auth_type === 'unified') return reveal(account.token_ciphertext);
+  // Legacy Instagram Login long-lived tokens can be refreshed before expiry.
   if (expiry && expiry - now() < 14 * 86400000 && now() - new Date(account.updated_at).getTime() > 86400000) {
     try { return await refreshAccount(account); }
     catch (e) { console.warn(`Token refresh for ${account.username}: ${e.message}`); }
@@ -225,14 +311,14 @@ async function publishPost(id) {
       const payload = post.kind === 'reel'
         ? { media_type: 'REELS', video_url: post.media_url, caption: post.caption, share_to_feed: 'true' }
         : { image_url: post.media_url, caption: post.caption };
-      const result = await metaRequest(`${GRAPH}/${account.id}/media`, { method: 'POST', params: payload, token, timeout: 90_000 });
+      const result = await metaRequest(`${account.auth_type === 'unified' ? UNIFIED_GRAPH : LEGACY_GRAPH}/${account.id}/media`, { method: 'POST', params: payload, token, timeout: 90_000 });
       if (!result.id) throw new Error('Meta did not return a media container ID.');
       containerId = String(result.id);
       setPostStatus(id, 'processing', { container_id: containerId });
     }
     let ready = false;
     for (let i = 0; i < 36; i++) {
-      const status = await metaRequest(`${GRAPH}/${containerId}`, { params: { fields: 'status_code,status' }, token });
+      const status = await metaRequest(`${account.auth_type === 'unified' ? UNIFIED_GRAPH : LEGACY_GRAPH}/${containerId}`, { params: { fields: 'status_code,status' }, token });
       if (status.status_code === 'FINISHED') { ready = true; break; }
       if (['ERROR', 'EXPIRED'].includes(status.status_code)) throw new Error(`Instagram rejected media: ${status.status || status.status_code}`);
       await sleep(10_000);
@@ -241,11 +327,11 @@ async function publishPost(id) {
     // Crash/network failure after sending media_publish has an ambiguous outcome.
     // Keep this state for manual review rather than risking a duplicate post.
     setPostStatus(id, 'publishing');
-    const published = await metaRequest(`${GRAPH}/${account.id}/media_publish`, { method: 'POST', params: { creation_id: containerId }, token, timeout: 90_000 });
+    const published = await metaRequest(`${account.auth_type === 'unified' ? UNIFIED_GRAPH : LEGACY_GRAPH}/${account.id}/media_publish`, { method: 'POST', params: { creation_id: containerId }, token, timeout: 90_000 });
     if (!published.id) throw new Error('Publish response did not contain an Instagram media ID. Check Instagram before retrying.');
     setPostStatus(id, 'published', { published_media_id: String(published.id), last_error: null });
     try {
-      const detail = await metaRequest(`${GRAPH}/${published.id}`, { params: { fields: 'permalink' }, token });
+      const detail = await metaRequest(`${account.auth_type === 'unified' ? UNIFIED_GRAPH : LEGACY_GRAPH}/${published.id}`, { params: { fields: 'permalink' }, token });
       if (detail.permalink) setPostStatus(id, 'published', { permalink: String(detail.permalink) });
     } catch { /* Publishing succeeded; permalink is optional. */ }
     console.log(`[publish] published ${id} as ${published.id}`);
@@ -397,46 +483,67 @@ async function handler(req, res) {
     return serveFile(req, res, path.join(UPLOAD_DIR, name), { publicFile: true });
   }
   if (route === '/auth/instagram/callback' && req.method === 'GET') {
-    authorize(req);
+    const session = sessionToken(req);
+    failIf(!session, 401, 'Your admin session expired. Sign in and start the connection again.');
     const state = u.searchParams.get('state') || '';
     const record = db.prepare('SELECT * FROM oauth_states WHERE state=?').get(state);
-    failIf(!record || record.expires_at < now(), 400, 'Login session expired. Start again from Settings.');
+    failIf(!record || record.expires_at < now() || !record.session_hash ||
+      record.session_hash !== sessionHash(session), 400, 'Login session expired or does not match your admin session. Start again from Connections.');
+    // Consume OAuth state exactly once, including on cancellation or failure.
     db.prepare('DELETE FROM oauth_states WHERE state=?').run(state);
     if (u.searchParams.has('error')) return redirect(res, '/?view=settings&oauth=denied');
     const code = (u.searchParams.get('code') || '').replace(/#_$/, '');
-    failIf(!code, 400, 'No authorization code returned by Instagram.');
+    failIf(!code, 400, 'Meta did not return an authorization code.');
     try {
-      const { short, long } = await exchangeOAuthCode(code);
-      const profile = await getProfile(long.access_token);
-      const accountId = String(profile.user_id || profile.id || short.user_id || '');
-      failIf(!accountId || !profile.username, 502, 'Instagram did not return a professional account ID and username.');
-      const expiry = new Date(now() + Number(long.expires_in || 5_184_000)*1000).toISOString();
-      const t = isoNow();
-      db.prepare(`INSERT INTO accounts (id, username, account_type, token_ciphertext, token_expires_at, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET username=excluded.username, account_type=excluded.account_type,
-          token_ciphertext=excluded.token_ciphertext,token_expires_at=excluded.token_expires_at,updated_at=excluded.updated_at`)
-        .run(accountId, profile.username, profile.account_type || 'Professional', protect(long.access_token), expiry, t, t);
+      if (record.flow === 'unified') {
+        await connectUnifiedAccounts(code);
+      } else {
+        const { short, long } = await exchangeOAuthCode(code);
+        const profile = await getProfile(long.access_token);
+        const accountId = String(profile.user_id || profile.id || short.user_id || '');
+        failIf(!/^\d+$/.test(accountId) || !profile.username, 502, 'Instagram did not return a professional account ID and username.');
+        const expiry = new Date(now() + Number(long.expires_in || 5_184_000)*1000).toISOString();
+        const t = isoNow();
+        db.prepare(`INSERT INTO accounts (id, username, account_type, token_ciphertext, token_expires_at, auth_type, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, 'instagram_login', ?, ?)
+          ON CONFLICT(id) DO UPDATE SET username=excluded.username, account_type=excluded.account_type,
+            token_ciphertext=excluded.token_ciphertext,token_expires_at=excluded.token_expires_at,
+            auth_type=excluded.auth_type,updated_at=excluded.updated_at`)
+          .run(accountId, profile.username, profile.account_type || 'Professional', protect(long.access_token), expiry, t, t);
+      }
       return redirect(res, '/?view=settings&oauth=connected');
     } catch (e) {
-      console.error('Instagram OAuth error:', e.message);
+      // Avoid logging tokens, authorization codes, or app secrets.
+      console.error('[instagram oauth]', String(e.message).slice(0, 500));
       return redirect(res, '/?view=settings&oauth=failed');
     }
   }
   if (route === '/auth/instagram/start' && req.method === 'GET') {
-    authorize(req);
-    failIf(!env.INSTAGRAM_APP_ID || !env.INSTAGRAM_APP_SECRET || !env.INSTAGRAM_REDIRECT_URI, 400, 'Set Instagram OAuth credentials in .env first.');
+    const session = sessionToken(req);
+    failIf(!session, 401, 'Please sign in first.');
+    failIf(!UNIFIED_CONFIGURED && !LEGACY_CONFIGURED, 400, 'Set META_APP_ID, META_APP_SECRET, META_CONFIG_ID, and INSTAGRAM_REDIRECT_URI in Railway Variables.');
+    const unified = UNIFIED_CONFIGURED;
     const state = crypto.randomBytes(24).toString('hex');
-    db.prepare('INSERT INTO oauth_states (state,expires_at) VALUES (?,?)').run(state, now() + 10*60_000);
+    db.prepare('INSERT INTO oauth_states (state,expires_at,session_hash,flow) VALUES (?,?,?,?)')
+      .run(state, now() + 10 * 60_000, sessionHash(session), unified ? 'unified' : 'legacy');
+    if (unified) {
+      const url = new URL('https://www.facebook.com/dialog/oauth');
+      url.search = new URLSearchParams({ client_id: env.META_APP_ID, config_id: env.META_CONFIG_ID,
+        redirect_uri: env.INSTAGRAM_REDIRECT_URI, response_type: 'code', prompt: 'login', state }).toString();
+      return redirect(res, url.href);
+    }
     const url = new URL('https://www.instagram.com/oauth/authorize');
-    url.search = new URLSearchParams({ client_id: env.INSTAGRAM_APP_ID, redirect_uri: env.INSTAGRAM_REDIRECT_URI, response_type: 'code', scope: 'instagram_business_basic,instagram_business_content_publish', state }).toString();
+    url.search = new URLSearchParams({ client_id: env.INSTAGRAM_APP_ID,
+      redirect_uri: env.INSTAGRAM_REDIRECT_URI, response_type: 'code',
+      scope: 'instagram_business_basic,instagram_business_content_publish', state }).toString();
     return redirect(res, url.href);
   }
   // All remaining API/file-download endpoints require admin session.
   if (route.startsWith('/api/')) {
     authorize(req);
     if (route === '/api/config' && req.method === 'GET') return json(res, 200, {
-      oauthConfigured: !!(env.INSTAGRAM_APP_ID && env.INSTAGRAM_APP_SECRET && env.INSTAGRAM_REDIRECT_URI),
+      oauthConfigured: UNIFIED_CONFIGURED || LEGACY_CONFIGURED,
+      oauthMode: UNIFIED_CONFIGURED ? 'unified' : LEGACY_CONFIGURED ? 'instagram_login' : null,
       publicMediaConfigured: /^https:\/\//.test(PUBLIC_BASE) && !PUBLIC_BASE.includes('example'),
       baseUrl: BASE, publicMediaBase: PUBLIC_BASE,
     });
@@ -566,7 +673,7 @@ const housekeeping = setInterval(() => {
   db.prepare('DELETE FROM sessions WHERE expires_at<?').run(now());
   db.prepare('DELETE FROM oauth_states WHERE expires_at<?').run(now());
   for (const a of db.prepare('SELECT * FROM accounts').all()) {
-    if (a.token_expires_at && new Date(a.token_expires_at).getTime() - now() < 14 * 86400000 && now() - new Date(a.updated_at).getTime() > 86400000) {
+    if (a.auth_type !== 'unified' && a.token_expires_at && new Date(a.token_expires_at).getTime() - now() < 14 * 86400000 && now() - new Date(a.updated_at).getTime() > 86400000) {
       void refreshAccount(a).catch(e => console.warn(`[refresh] ${a.username}: ${e.message}`));
     }
   }
