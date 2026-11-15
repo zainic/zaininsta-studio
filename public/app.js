@@ -100,9 +100,9 @@ function renderDownloads() {
 }
 function renderSettings() {
   $('#connect-btn').classList.toggle('hidden',!state.config.oauthConfigured);
-  $('#account-list').innerHTML = state.accounts.length ? state.accounts.map(a=>`<div class="account-row"><div class="account-avatar">${esc(a.username.slice(0,1).toUpperCase())}</div><div><strong>@${esc(a.username)}</strong><small>${esc(a.accountType)} · Token expires ${a.tokenExpiresAt?formatDate(a.tokenExpiresAt):'unknown'}</small></div><button class="mini-action danger" data-disconnect="${esc(a.id)}">Disconnect</button></div>`).join('') : `<div class="empty-mini">${icon('link')}<strong>No Instagram accounts connected</strong><span>${state.config.oauthConfigured?'Use Connect Instagram above.':'Add Meta credentials in .env first.'}</span></div>`;
+  $('#account-list').innerHTML = state.accounts.length ? state.accounts.map(a=>`<div class="account-row"><div class="account-avatar">${esc(a.username.slice(0,1).toUpperCase())}</div><div><strong>@${esc(a.username)}</strong><small>${esc(a.accountType)} · ${a.authType==='unified'?'Unified Login':'Instagram Login'} · ${a.tokenExpiresAt?'Expires '+formatDate(a.tokenExpiresAt):'No expiration reported'}</small></div><button class="mini-action danger" data-disconnect="${esc(a.id)}">Disconnect</button></div>`).join('') : `<div class="empty-mini">${icon('link')}<strong>No Instagram accounts connected</strong><span>${state.config.oauthConfigured?'Use Connect Instagram above.':'Add Meta credentials in .env first.'}</span></div>`;
   const checks = [
-    {text:'Meta Instagram app credentials',ok:state.config.oauthConfigured},
+    {text:state.config.oauthMode==='unified'?'Meta Unified Login configured':'Meta Instagram API credentials',ok:state.config.oauthConfigured},
     {text:'Public HTTPS media URL',ok:state.config.publicMediaConfigured},
     {text:'Instagram account connected',ok:state.accounts.length>0}
   ];
