@@ -696,6 +696,27 @@ async function handler(req, res) {
       void runDownloader(id, source);
       return json(res, 202, { id, status: 'queued' });
     }
+    const clearDownloadMatch = route.match(/^\/api\/downloads\/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/);
+    if (clearDownloadMatch && req.method === 'DELETE') {
+      const record = db.prepare('SELECT * FROM downloads WHERE id=?').get(clearDownloadMatch[1]);
+      failIf(!record, 404, 'Download not found.');
+      failIf(!['ready', 'failed'].includes(record.status), 409, 'Wait for this download to finish before clearing it.');
+      failIf(record.filename && (path.basename(record.filename) !== record.filename || !record.filename.startsWith(record.id + '.')), 400, 'Invalid download file.');
+      try {
+        // Delete only this job's files, including any leftover partial files.
+        // Never recursively remove directories or follow paths from the database.
+        const files = (await fsp.readdir(DOWNLOAD_DIR)).filter(name => name.startsWith(record.id + '.'));
+        for (const name of files) {
+          await fsp.unlink(path.join(DOWNLOAD_DIR, name)).catch(error => { if (error.code !== 'ENOENT') throw error; });
+        }
+      } catch (error) {
+        console.warn(`[download] clear ${record.id}: ${error.code || 'filesystem error'}`);
+        throw new HttpError(503, 'Could not delete the saved files. Try clearing this download again.');
+      }
+      // Keep the record if deleting its files failed, so clearing can be retried.
+      db.prepare('DELETE FROM downloads WHERE id=?').run(record.id);
+      return json(res, 200, { ok: true });
+    }
     const downloadMatch = route.match(/^\/api\/downloads\/([a-f0-9-]{36})\/file$/);
     if (downloadMatch && req.method === 'GET') {
       const d = db.prepare('SELECT * FROM downloads WHERE id=?').get(downloadMatch[1]);

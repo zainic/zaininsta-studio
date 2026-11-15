@@ -1,6 +1,6 @@
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
-const state = { view: 'overview', filter: 'all', accounts: [], posts: [], media: [], downloads: [], stats: {}, config: {}, toastTimer: null };
+const state = { view: 'overview', filter: 'all', accounts: [], posts: [], media: [], downloads: [], selectedDownloads: new Set(), clearingDownloads: false, stats: {}, config: {}, toastTimer: null };
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
 const icon = name => `<svg aria-hidden="true"><use href="#i-${name}"></use></svg>`;
 const formatDate = value => { try { return new Intl.DateTimeFormat(undefined, { month:'short', day:'numeric', year:'numeric' }).format(new Date(value)); } catch { return '—'; } };
@@ -94,9 +94,58 @@ function renderLibrary() {
   $('#media-count').textContent=state.media.length;
   $('#media-list').innerHTML = state.media.length ? state.media.map(m=>`<div class="media-card"><div class="media-visual">${m.mime==='image/jpeg'?`<img src="${esc(m.url)}" alt="${esc(m.name)}" loading="lazy">`:`<video src="${esc(m.url)}" muted preload="metadata" playsinline></video>`}</div><div class="media-card-body"><strong title="${esc(m.name)}">${esc(m.name)}</strong><small>${filesize(m.size)} · ${formatShortDate(m.createdAt)}</small><div class="media-card-actions"><button data-copy="${esc(m.url)}">${icon('copy')} Copy URL</button><button data-use="${esc(m.url)}">Use in post</button><button data-delete-media="${m.id}" title="Delete file" aria-label="Delete file">${icon('trash')}</button></div></div></div>`).join('') : '<div class="empty-library">Your media library is empty. Upload a JPEG, MP4, or MOV to get started.</div>';
 }
+function clearableDownload(download) { return ['ready','failed'].includes(download.status); }
+function updateDownloadSelection() {
+  const eligible = state.downloads.filter(clearableDownload);
+  const selected = state.selectedDownloads.size;
+  const all = $('#select-all-downloads');
+  if (all) {
+    all.checked = eligible.length > 0 && selected === eligible.length;
+    all.indeterminate = selected > 0 && selected < eligible.length;
+    all.disabled = state.clearingDownloads || eligible.length === 0;
+  }
+  $$('[data-select-download]').forEach(input => {
+    input.checked = state.selectedDownloads.has(input.dataset.selectDownload);
+    input.closest('tr').classList.toggle('download-selected', input.checked);
+  });
+  $('#downloads-selection-count').textContent = `${selected} selected`;
+  const button = $('#clear-downloads');
+  button.disabled = state.clearingDownloads || selected === 0;
+  button.innerHTML = `${icon('trash')} ${state.clearingDownloads ? 'Clearing...' : 'Clear selected'}`;
+}
 function renderDownloads() {
   const downloads = state.downloads;
-  $('#downloads-list').innerHTML = downloads.length ? `<div class="table-scroll"><table class="data-table"><thead><tr><th>INSTAGRAM LINK</th><th>ADDED</th><th>STATUS</th><th>METHOD</th><th>FILE</th></tr></thead><tbody>${downloads.map(d=>`<tr><td><div class="download-url-cell" title="${esc(d.sourceUrl)}">${esc(d.sourceUrl)}</div></td><td>${formatShortDate(d.createdAt)}<span class="post-sub">${formatTime(d.createdAt)}</span></td><td><span class="status-pill ${d.status==='ready'?'published':d.status==='failed'?'failed':'processing'}">${esc(capitalize(d.status))}</span>${d.lastError?`<span class="post-sub download-error" title="${esc(d.lastError)}">${esc(d.lastError)}</span>`:''}</td><td><span class="post-sub">${esc(d.sourceMethod==='meta'?'Meta API':d.sourceMethod==='yt-dlp'?'Public extractor':'—')}</span></td><td>${d.status==='ready'?`<a class="mini-action" href="/api/downloads/${d.id}/file">${icon('download')} Download</a>`:'—'}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty-table"><strong>No downloads yet.</strong>Your downloaded videos will show up here.</div>';
+  const eligible = new Set(downloads.filter(clearableDownload).map(d => d.id));
+  for (const id of state.selectedDownloads) if (!eligible.has(id)) state.selectedDownloads.delete(id);
+  $('#downloads-list').innerHTML = downloads.length ? `<div class="table-scroll"><table class="data-table"><thead><tr><th class="download-select-cell"><input type="checkbox" id="select-all-downloads" aria-label="Select all finished downloads" /></th><th>INSTAGRAM LINK</th><th>ADDED</th><th>STATUS</th><th>METHOD</th><th>FILE</th></tr></thead><tbody>${downloads.map(d=>`<tr><td class="download-select-cell"><input type="checkbox" data-select-download="${esc(d.id)}" aria-label="Select download ${esc(d.sourceUrl)}" ${state.selectedDownloads.has(d.id)?'checked':''} ${state.clearingDownloads || !clearableDownload(d)?'disabled':''} /></td><td><div class="download-url-cell" title="${esc(d.sourceUrl)}">${esc(d.sourceUrl)}</div></td><td>${formatShortDate(d.createdAt)}<span class="post-sub">${formatTime(d.createdAt)}</span></td><td><span class="status-pill ${d.status==='ready'?'published':d.status==='failed'?'failed':'processing'}">${esc(capitalize(d.status))}</span>${d.lastError?`<span class="post-sub download-error" title="${esc(d.lastError)}">${esc(d.lastError)}</span>`:''}</td><td><span class="post-sub">${esc(d.sourceMethod==='meta'?'Meta API':d.sourceMethod==='yt-dlp'?'Public extractor':'\u2014')}</span></td><td>${d.status==='ready'?`<a class="mini-action" href="/api/downloads/${esc(d.id)}/file">${icon('download')} Download</a>`:'\u2014'}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty-table"><strong>No downloads yet.</strong>Your downloaded videos will show up here.</div>';
+  updateDownloadSelection();
+}
+async function clearSelectedDownloads() {
+  if (state.clearingDownloads) return;
+  const ids = state.downloads.filter(d => clearableDownload(d) && state.selectedDownloads.has(d.id)).map(d => d.id);
+  if (!ids.length || !confirm(`Clear ${ids.length} selected download${ids.length === 1 ? '' : 's'}? Saved video files will be permanently deleted and their download links will stop working.`)) return;
+  state.clearingDownloads = true;
+  renderDownloads();
+  let cleared = 0;
+  const errors = [];
+  try {
+    for (const id of ids) {
+      try {
+        await api('/api/downloads/' + id, 'DELETE');
+        state.selectedDownloads.delete(id);
+        state.downloads = state.downloads.filter(d => d.id !== id);
+        cleared++;
+      } catch (error) { errors.push(error.message); }
+    }
+    let refreshError = '';
+    try { state.downloads = (await api('/api/downloads')).downloads; }
+    catch { refreshError = ' Refresh history to load the latest list.'; }
+    const message = `${cleared} download${cleared === 1 ? '' : 's'} cleared.${errors.length ? ` Could not clear ${errors.length}: ${errors[0]}` : ''}${refreshError}`;
+    toast(message, errors.length > 0 || !!refreshError);
+  } finally {
+    state.clearingDownloads = false;
+    renderDownloads();
+  }
 }
 function renderSettings() {
   $('#connect-btn').classList.toggle('hidden',!state.config.oauthConfigured);
@@ -176,6 +225,20 @@ function bindEvents() {
   });
   $('#refresh-posts').addEventListener('click',()=>refreshPart('posts'));
   $('#refresh-downloads').addEventListener('click',()=>refreshPart('downloads'));
+  $('#clear-downloads').addEventListener('click',clearSelectedDownloads);
+  $('#downloads-list').addEventListener('change',e=>{
+    if (state.clearingDownloads) return;
+    if (e.target.id === 'select-all-downloads') {
+      state.selectedDownloads.clear();
+      if (e.target.checked) state.downloads.filter(clearableDownload).forEach(d => state.selectedDownloads.add(d.id));
+    } else if (e.target.matches('[data-select-download]')) {
+      const id = e.target.dataset.selectDownload;
+      if (!state.downloads.some(d => d.id === id && clearableDownload(d))) return;
+      if (e.target.checked) state.selectedDownloads.add(id);
+      else state.selectedDownloads.delete(id);
+    } else return;
+    updateDownloadSelection();
+  });
   $('#post-account').addEventListener('change',updatePreview);
   $('#post-media').addEventListener('input',updatePreview);
   $('#post-caption').addEventListener('input',updatePreview);
