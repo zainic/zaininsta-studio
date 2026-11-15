@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { findOwnedVideo, streamOwnedVideo, classifyExtractorFailure, isTrustedInstagramCdn, instagramShortcode } from '../download-helper.mjs';
+import { findOwnedVideo, streamOwnedVideo, classifyExtractorFailure, isTrustedInstagramCdn, instagramShortcode, finalizedExtractorFile, redactDownloaderDiagnostic } from '../download-helper.mjs';
 
 const sample = 'https://www.instagram.com/reel/DISPLAY_123/';
 const cdnUrl = 'https://scontent.cdninstagram.com/v/authorized-video.mp4?oh=signed';
@@ -55,4 +55,33 @@ test('yt-dlp failures are actionable, never leak raw tokens', () => {
   assert.doesNotMatch(msg,/SENSITIVE/);
   assert.match(classifyExtractorFailure('No space left on device',1),/Storage is full/);
   assert.match(classifyExtractorFailure('ERROR: Unsupported URL',1),/No downloadable video/);
+});
+
+
+test('extractor completion requires one finalized, nonempty job-owned file', async () => {
+  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'zaininsta-completion-'));
+  try {
+    const id='job-123', name=id+'.mp4', file=path.join(dir,name);
+    const record=value=>'ZAININSTA_FILE:'+JSON.stringify(value)+'\n';
+    await fs.writeFile(file,'video data');
+    assert.equal(await finalizedExtractorFile(record(file),{directory:dir,id}),name);
+    await assert.rejects(finalizedExtractorFile('download started',{directory:dir,id}),/did not finalize/);
+    await assert.rejects(finalizedExtractorFile(record(file)+record(file),{directory:dir,id}),/did not finalize/);
+    await assert.rejects(finalizedExtractorFile(record(path.join(dir,'other.mp4')),{directory:dir,id}),/invalid output path/);
+    await assert.rejects(finalizedExtractorFile(record(path.join(dir,'..',name)),{directory:dir,id}),/invalid output path/);
+    await assert.rejects(finalizedExtractorFile(record(file+'.part'),{directory:dir,id}),/invalid output path/);
+    await assert.rejects(finalizedExtractorFile(record(file),{directory:dir,id,maxBytes:2}),/250 MB/);
+    await fs.writeFile(file,'');
+    await assert.rejects(finalizedExtractorFile(record(file),{directory:dir,id}),/empty/);
+  } finally { await fs.rm(dir,{recursive:true,force:true}); }
+});
+
+test('extractor diagnostics remove URLs and credentials; local failures avoid Railway assumptions', () => {
+  const safe=redactDownloaderDiagnostic('https://cdn.example/video?signature=SECRET1\nAuthorization: Bearer SECRET2\nCookie: sessionid=SECRET3; csrftoken=SECRET4\n{"access_token":"SECRET5"}\ntoken=SECRET6');
+  assert.doesNotMatch(safe,/SECRET[1-6]/);
+  assert.match(classifyExtractorFailure('',101),/limit or cancellation/);
+  assert.doesNotMatch(classifyExtractorFailure('',101),/See your Railway/);
+  assert.match(classifyExtractorFailure('ERROR: ffmpeg not found',1),/requires FFmpeg/);
+  assert.doesNotMatch(classifyExtractorFailure('',9),/Railway|login/);
+  assert.match(classifyExtractorFailure('WARNING: ffmpeg not found',101),/limit or cancellation/);
 });

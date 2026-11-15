@@ -36,7 +36,7 @@ test('Unified Login end-to-end with mocked Meta: OAuth, multiple accounts, legac
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'zaininsta-unified-'));
   for (const file of ['server.js','sqlite-driver.mjs','download-helper.mjs','package.json']) await fs.copyFile(path.join(root,file),path.join(tmp,file));
   await fs.cp(path.join(root,'public'),path.join(tmp,'public'),{recursive:true});
-  try { await fs.symlink(path.join(root,'node_modules'),path.join(tmp,'node_modules'),'dir'); }
+  try { await fs.symlink(path.join(root,'node_modules'),path.join(tmp,'node_modules'),process.platform === 'win32' ? 'junction' : 'dir'); }
   catch (err) { if (!['EEXIST','ENOENT'].includes(err.code)) throw err; }
   await fs.mkdir(path.join(tmp,'data'),{recursive:true});
   const key = crypto.randomBytes(32);

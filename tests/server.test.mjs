@@ -6,7 +6,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { DatabaseSync } from '../sqlite-driver.mjs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const encKey = crypto.randomBytes(32);
@@ -34,12 +34,36 @@ test('self-hosted dashboard API: login, upload, schedule, cancel and disconnect'
   await fs.copyFile(path.join(root,'download-helper.mjs'),path.join(tmp,'download-helper.mjs'));
   // Native dependencies are installed at the project root; the isolated
   // test server needs access to the same installation on Node.js 20.
-  try { await fs.symlink(path.join(root,'node_modules'),path.join(tmp,'node_modules'),'dir'); } catch (error) { if (error.code !== 'ENOENT' && error.code !== 'EEXIST') throw error; }
+  try { await fs.symlink(path.join(root,'node_modules'),path.join(tmp,'node_modules'),process.platform === 'win32' ? 'junction' : 'dir'); } catch (error) { if (error.code !== 'ENOENT' && error.code !== 'EEXIST') throw error; }
   await fs.copyFile(path.join(root,'package.json'),path.join(tmp,'package.json'));
   await fs.cp(path.join(root,'public'),path.join(tmp,'public'),{recursive:true});
-  const fakeDlp=path.join(tmp,'fake-yt-dlp');
-  await fs.writeFile(fakeDlp,'#!/usr/bin/env node\nconsole.error("ERROR: [Instagram] Requested content is not available, rate-limit reached or login required");process.exit(1);\n',{mode:0o755});
-  const child=spawn(process.execPath,['server.js'], {cwd:tmp,env:{...process.env,YT_DLP_BIN:fakeDlp,PORT:String(port),APP_BASE_URL:base,PUBLIC_BASE_URL:'https://assets.studio.test',ADMIN_PASSWORD:'test-password-not-for-production',ENCRYPTION_KEY:encKey.toString('base64'),SESSION_SECRET:sessionSecret,GRAPH_VERSION:'v27.0'}, stdio:'ignore'});
+  // Run a deterministic extractor fixture with Node on Windows and POSIX.
+  const fakeDlp=path.join(tmp,'fake-yt-dlp.mjs');
+  await fs.writeFile(fakeDlp, `
+import fs from 'node:fs';
+import path from 'node:path';
+const args=process.argv.slice(2), source=args.at(-1);
+if(args.includes('--max-downloads') || args[args.indexOf('--playlist-items')+1] !== '1') process.exit(9);
+if(args[args.indexOf('--print')+1] !== 'after_move:ZAININSTA_FILE:%(filepath)j') process.exit(9);
+if(source.includes('GOODTESTCODE')) {
+ console.error('ERROR: [Instagram] Requested content is not available, rate-limit reached or login required'); process.exit(1);
+}
+const name=args[args.indexOf('-o')+1].replace('%(ext)s','mp4');
+const output=path.join(args[args.indexOf('-P')+1],name);
+if(source.includes('PARTIALCODE')) { fs.writeFileSync(output+'.part','unfinished'); process.exit(0); }
+fs.writeFileSync(output,source.includes('EMPTYCODE') ? '' : 'completed video fixture');
+console.log('ZAININSTA_FILE:'+JSON.stringify(output));
+process.exit(source.includes('LIMITCODE') ? 101 : 0);
+`);
+  const preload=path.join(tmp,'extractor-preload.mjs');
+  await fs.writeFile(preload, `
+import cp from 'node:child_process';
+import {syncBuiltinESMExports} from 'node:module';
+const original=cp.spawn;
+cp.spawn=(command,args,options)=>command===${JSON.stringify(fakeDlp)} ? original(process.execPath,[command,...args],options) : original(command,args,options);
+syncBuiltinESMExports();
+`);
+  const child=spawn(process.execPath,['server.js'], {cwd:tmp,env:{...process.env,NODE_OPTIONS:[process.env.NODE_OPTIONS,'--import='+pathToFileURL(preload).href].filter(Boolean).join(' '),YT_DLP_BIN:fakeDlp,PORT:String(port),APP_BASE_URL:base,PUBLIC_BASE_URL:'https://assets.studio.test',ADMIN_PASSWORD:'test-password-not-for-production',ENCRYPTION_KEY:encKey.toString('base64'),SESSION_SECRET:sessionSecret,GRAPH_VERSION:'v27.0'}, stdio:'ignore'});
   t.after(async()=>{child.kill('SIGTERM');await new Promise(r=>setTimeout(r,200));await fs.rm(tmp,{recursive:true,force:true,maxRetries:4,retryDelay:200});});
   await waitForReady(child);
   const health=await (await fetch(base+'/api/health')).json(); assert.equal(health.ok,true);
@@ -70,6 +94,32 @@ test('self-hosted dashboard API: login, upload, schedule, cancel and disconnect'
   assert.equal(failedDownload?.status,'failed');
   assert.match(failedDownload.lastError,/Instagram blocked/);
   assert.equal(failedDownload.sourceMethod,null);
+
+  async function downloadFixture(shortcode) {
+    const response=await request('/api/downloads','POST',{url:`https://www.instagram.com/reel/${shortcode}/`,confirmRights:true});
+    assert.equal(response.status,202);
+    const {id}=await response.json();
+    for(let i=0;i<100;i++) {
+      const rows=(await (await request('/api/downloads')).json()).downloads;
+      const row=rows.find(d=>d.id===id);
+      if(row && ['ready','failed'].includes(row.status)) return row;
+      await new Promise(r=>setTimeout(r,50));
+    }
+    throw new Error('Fixture download did not finish');
+  }
+  const completed=await downloadFixture('SUCCESSCODE');
+  assert.equal(completed.status,'ready');
+  assert.equal(completed.sourceMethod,'yt-dlp');
+  const downloaded=await request(`/api/downloads/${completed.id}/file`);
+  assert.equal(downloaded.status,200);
+  assert.equal(await downloaded.text(),'completed video fixture');
+  for(const [shortcode,message] of [['LIMITCODE',/limit or cancellation/],['PARTIALCODE',/did not finalize/],['EMPTYCODE',/missing, incomplete, or empty/]]) {
+    const failed=await downloadFixture(shortcode);
+    assert.equal(failed.status,'failed');
+    assert.match(failed.lastError,message);
+    assert.equal((await fs.readdir(path.join(tmp,'data','downloads'))).some(name=>name.startsWith(failed.id+'.')),false);
+  }
+
 
   const date=new Date(Date.now()+3600000).toISOString();
   const noAccount=await request('/api/posts','POST',{accountId:'1',kind:'image',mediaUrl:upload.url,caption:'Test!',mode:'scheduled',scheduledAt:date});assert.equal(noAccount.status,400);

@@ -8,7 +8,7 @@ import { DatabaseSync } from './sqlite-driver.mjs';
 import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
 import { spawn } from 'node:child_process';
-import { classifyExtractorFailure, findOwnedVideo, streamOwnedVideo } from './download-helper.mjs';
+import { classifyExtractorFailure, findOwnedVideo, streamOwnedVideo, finalizedExtractorFile, redactDownloaderDiagnostic } from './download-helper.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DATA = path.join(ROOT, 'data');
@@ -369,65 +369,82 @@ async function findAuthorizedVideo(url) {
   }});
 }
 async function runYtDlp(id, url) {
-  const args = ['--ignore-config', '--no-playlist', '--max-downloads', '1', '--max-filesize', '250M',
-    '--no-progress', '--no-write-thumbnail', '--no-write-info-json',
+  // --max-downloads cancels yt-dlp with exit 101 after a successful download.
+  // Select one entry instead, including when Instagram returns a carousel.
+  const args = ['--ignore-config', '--no-playlist', '--playlist-items', '1', '--max-filesize', '250M',
+    '--no-progress', '--no-write-thumbnail', '--no-write-info-json', '--no-simulate',
+    '--print', 'after_move:ZAININSTA_FILE:%(filepath)j',
     '--socket-timeout', '20', '--retries', '2', '--fragment-retries', '2', '--merge-output-format', 'mp4',
     '-P', DOWNLOAD_DIR, '-o', `${id}.%(ext)s`, url];
-  await new Promise((resolve, reject) => {
-    const child = spawn(YT_DLP, args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stderr = '', stopped = false;
-    child.stdout.on('data', () => {});
+  const output = await new Promise((resolve, reject) => {
+    const child = spawn(YT_DLP, args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    let stdout = '', stderr = '', stopped = false, stopError = null;
+    child.stdout.on('data', d => { stdout = (stdout + d.toString()).slice(-12000); });
     child.stderr.on('data', d => { stderr = (stderr + d.toString()).slice(-6000); });
-    child.on('error', e => { stopped = true; reject(new Error(e.code === 'ENOENT' ? 'yt-dlp is not installed. Install it or use Docker.' : e.message)); });
-    const timer = setInterval(async () => {
+    function finish(error) {
+      clearInterval(timer); clearTimeout(timeout);
       if (stopped) return;
+      stopped = true;
+      error ? reject(error) : resolve(stdout);
+    }
+    function stop(error) {
+      if (stopped || stopError) return;
+      stopError = error;
+      // Wait for close before cleanup so the process cannot recreate partial files.
+      child.kill('SIGKILL');
+    }
+    child.on('error', e => finish(new Error(e.code === 'ENOENT' ? 'yt-dlp is not installed. Install it or use Docker.' : e.message)));
+    const timer = setInterval(async () => {
+      if (stopped || stopError) return;
       try {
         const names = (await fsp.readdir(DOWNLOAD_DIR)).filter(n => n.startsWith(`${id}.`));
         let bytes = 0;
         for (const n of names) bytes += (await fsp.stat(path.join(DOWNLOAD_DIR, n))).size;
-        if (bytes > MAX_DOWNLOAD) { stopped = true; child.kill('SIGKILL'); reject(new Error('Video exceeds 250 MB download limit.')); }
+        if (bytes > MAX_DOWNLOAD) stop(new Error('Video exceeds 250 MB download limit.'));
       } catch { /* File may be moving while downloading */ }
     }, 1500);
-    const timeout = setTimeout(() => { if (!stopped) { stopped = true; child.kill('SIGKILL'); reject(new Error('Download timed out after 5 minutes.')); } }, 300_000);
-    child.on('close', code => {
-      clearInterval(timer); clearTimeout(timeout);
+    const timeout = setTimeout(() => stop(new Error('Download timed out after 5 minutes.')), 300_000);
+    child.on('close', (code, signal) => {
       if (stopped) return;
-      stopped = true;
-      code === 0 ? resolve() : reject(new Error(classifyExtractorFailure(stderr, code)));
-      if (code !== 0) console.warn(`[yt-dlp] download ${id} failed, exit ${code}: ${stderr.slice(-1500).replace(/(?:access_token|token|cookie|authorization)=\S+/gi,'[redacted]')}`);
+      if (stopError || code !== 0) {
+        const diagnostic = redactDownloaderDiagnostic(stderr + '\n' + stdout).slice(-2500);
+        console.warn(`[yt-dlp] ${JSON.stringify({ downloadId: id, exitCode: code, signal, diagnostic })}`);
+        finish(stopError || new Error(signal ? `Video downloader stopped by signal ${signal}. Check the application server logs.` : classifyExtractorFailure(stderr + '\n' + stdout, code)));
+      } else finish();
     });
   });
+  return finalizedExtractorFile(output, { directory: DOWNLOAD_DIR, id, maxBytes: MAX_DOWNLOAD });
 }
 let activeDownloads = 0;
 async function runDownloader(id, url) {
   activeDownloads++;
   db.prepare("UPDATE downloads SET status='downloading', updated_at=? WHERE id=?").run(isoNow(), id);
   try {
-    let sourceMethod = 'yt-dlp';
+    let sourceMethod = 'yt-dlp', filename;
     // The Graph API can resolve a user's own media more reliably than scraping
     // an Instagram webpage from a Railway cloud IP.
     const authorized = await findAuthorizedVideo(url).catch(e => {
-      console.warn(`[download] Meta media lookup unavailable: ${String(e.message).slice(0, 180)}`);
+      console.warn(`[download] Meta media lookup unavailable: ${redactDownloaderDiagnostic(e.message).slice(0, 180)}`);
       return null;
     });
     if (authorized) {
       try {
         await streamOwnedVideo(authorized.url, path.join(DOWNLOAD_DIR, `${id}.mp4`), { maxBytes: MAX_DOWNLOAD });
         sourceMethod = 'meta';
+        filename = `${id}.mp4`;
       } catch (error) {
         // A transient CDN failure can fall back to the regular public extractor.
-        console.warn(`[download] Meta media copy failed: ${String(error.message).slice(0, 180)}`);
+        console.warn(`[download] Meta media copy failed: ${redactDownloaderDiagnostic(error.message).slice(0, 180)}`);
         await fsp.rm(path.join(DOWNLOAD_DIR, `${id}.mp4`), { force: true });
-        await runYtDlp(id, url);
+        filename = await runYtDlp(id, url);
       }
     } else {
-      await runYtDlp(id, url);
+      filename = await runYtDlp(id, url);
     }
-    const files = (await fsp.readdir(DOWNLOAD_DIR)).filter(n => n.startsWith(`${id}.`) && !/\.(?:part|ytdl|temp)$/.test(n));
-    if (files.length !== 1) throw new Error('Could not locate a single downloaded video.');
-    const size = (await fsp.stat(path.join(DOWNLOAD_DIR, files[0]))).size;
+    const size = (await fsp.stat(path.join(DOWNLOAD_DIR, filename))).size;
     if (!size || size > MAX_DOWNLOAD) throw new Error('Download is empty or exceeds the size limit.');
-    db.prepare("UPDATE downloads SET status='ready', filename=?, source_method=?, last_error=NULL, updated_at=? WHERE id=?").run(files[0], sourceMethod, isoNow(), id);
+    db.prepare("UPDATE downloads SET status='ready', filename=?, source_method=?, last_error=NULL, updated_at=? WHERE id=?").run(filename, sourceMethod, isoNow(), id);
+    console.info(`[download] ${id}: ready via ${sourceMethod}, ${size} bytes`);
   } catch (e) {
     const files = (await fsp.readdir(DOWNLOAD_DIR)).filter(n => n.startsWith(`${id}.`));
     for (const f of files) await fsp.rm(path.join(DOWNLOAD_DIR, f), { force: true }).catch(() => {});
