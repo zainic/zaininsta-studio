@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import path from 'node:path';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
@@ -73,16 +74,20 @@ export function classifyExtractorFailure(stderr = '', exitCode = null) {
   if (/HTTP Error 404|post is unavailable|private account|not available/i.test(raw)) {
     return 'The post may have been deleted, made private, or restricted. Check that it is public and its URL opens in a logged-out browser.';
   }
+  if (/^ERROR:.*(?:ffmpeg|ffprobe).*(?:not found|not installed|required)/im.test(raw)) {
+    return 'This video requires FFmpeg to merge or process its media. Install FFmpeg on the application server and retry.';
+  }
   if (/Unsupported URL|No video formats|requested format is not available/i.test(raw)) {
     return 'No downloadable video was found at that Instagram link. Check that it points to a Reel or video post.';
   }
   if (/No space left on device|disk quota exceeded/i.test(raw)) {
-    return 'Storage is full. Free space on your Railway /app/data volume before downloading again.';
+    return 'Storage is full. Free space in the application data directory (Railway: /app/data) before downloading again.';
   }
   if (/timed out|timeout|Temporary failure in name resolution|name or service not known/i.test(raw)) {
-    return 'The Instagram connection timed out or DNS failed from the server. Retry later and inspect Railway networking logs.';
+    return 'The Instagram connection timed out or DNS failed from the server. Retry later and inspect the application server networking logs.';
   }
-  return `yt-dlp failed (exit ${exitCode ?? '?'}). See your Railway logs for diagnostics; public Instagram links may require a logged-in session or be restricted by the platform.`;
+  if (exitCode === 101) return 'The video downloader stopped at a configured download limit or cancellation rule. Check the application server logs; this does not by itself mean Instagram blocked the video.';
+  return `yt-dlp failed (exit ${exitCode ?? '?'}). Check the application server logs for diagnostics.`;
 }
 
 /**
@@ -125,4 +130,32 @@ export async function streamOwnedVideo(mediaUrl, destination, { fetchImpl = fetc
     }
   }
   throw new Error('Instagram CDN redirected too many times.');
+}
+
+/** Remove signed URLs and credentials before recording extractor diagnostics. */
+export function redactDownloaderDiagnostic(value) {
+  return String(value)
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[URL redacted]')
+    .replace(/\b(?:authorization|proxy-authorization|cookie|set-cookie)\s*[:=][^\r\n]*/gi, '[credentials redacted]')
+    .replace(/(["']?\b(?:access_token|refresh_token|token|client_secret|password)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, '$1[redacted]');
+}
+
+/** Only accept the single file yt-dlp reported after downloading and moving it. */
+export async function finalizedExtractorFile(output, { directory, id, maxBytes = 250 * 1024 * 1024 }) {
+  const prefix = 'ZAININSTA_FILE:';
+  const records = String(output).split(/\r?\n/).filter(line => line.startsWith(prefix));
+  if (records.length !== 1) throw new Error('The video downloader did not finalize a single video file. It may have skipped the video or exceeded the 250 MB limit.');
+  let filename;
+  try { filename = JSON.parse(records[0].slice(prefix.length)); } catch { /* Report a safe error below. */ }
+  if (typeof filename !== 'string') throw new Error('The video downloader returned an invalid output path.');
+  const name = path.basename(filename);
+  if (!name.startsWith(`${id}.`) || /\.(?:part(?:-Frag\d+)?|ytdl|temp)$/i.test(name) ||
+      path.resolve(filename) !== path.resolve(directory, name)) {
+    throw new Error('The video downloader returned an invalid output path.');
+  }
+  const stat = await fsp.lstat(path.join(directory, name)).catch(() => null);
+  if (!stat?.isFile() || !stat.size) throw new Error('The video downloader output is missing, incomplete, or empty.');
+  if (stat.size > maxBytes) throw new Error('Video exceeds 250 MB download limit.');
+  return name;
 }

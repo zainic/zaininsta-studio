@@ -11,7 +11,7 @@
     "start": "node server.js",
     "init": "node init.mjs",
     "dev": "node --watch server.js",
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test"
   },
   "dependencies": {
     "better-sqlite3": "11.10.0"
