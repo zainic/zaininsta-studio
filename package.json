@@ -1,9 +1,9 @@
 {
   "name": "zaininsta-studio",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
-  "description": "Zaininsta Studio: self-hosted Instagram publishing scheduler with Meta Unified Login and video downloader",
+  "description": "Zaininsta Studio: self-hosted Instagram publishing scheduler with Meta Unified Login and two-path video downloader",
   "engines": {
     "node": ">=20.18.0 <21 || >=22 <23"
   },

@@ -8,6 +8,7 @@ import { DatabaseSync } from './sqlite-driver.mjs';
 import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
 import { spawn } from 'node:child_process';
+import { classifyExtractorFailure, findOwnedVideo, streamOwnedVideo } from './download-helper.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DATA = path.join(ROOT, 'data');
@@ -109,6 +110,7 @@ addColumnIfMissing('accounts', 'client_business_id', 'TEXT');
 addColumnIfMissing('accounts', 'meta_config_id', 'TEXT');
 addColumnIfMissing('oauth_states', 'session_hash', 'TEXT');
 addColumnIfMissing('oauth_states', 'flow', "TEXT NOT NULL DEFAULT 'legacy'");
+addColumnIfMissing('downloads', 'source_method', "TEXT");
 // An interrupted publish request could already have succeeded. Never auto-retry those.
 db.prepare("UPDATE posts SET status='scheduled', updated_at=? WHERE status='processing'").run(isoNow());
 db.prepare("UPDATE posts SET status='needs_review', last_error='Server restarted during publication. Check Instagram manually; do not blindly retry.', updated_at=? WHERE status='publishing'").run(isoNow());
@@ -353,43 +355,79 @@ function tick() {
     void publishPost(id);
   }
 }
+// Use Meta's authorized API for videos on an account connected to this studio.
+// For other *public* links use yt-dlp. Neither method bypasses access limits.
+async function findAuthorizedVideo(url) {
+  const accounts = db.prepare('SELECT * FROM accounts ORDER BY updated_at DESC LIMIT 5').all();
+  if (!accounts.length) return null;
+  return findOwnedVideo({ url, accounts, maxPages: 3, listMedia: async (account, after) => {
+    const token = await accountToken(account);
+    const base = account.auth_type === 'unified' ? UNIFIED_GRAPH : LEGACY_GRAPH;
+    const params = { fields: 'id,shortcode,permalink,media_type,media_url,children{media_type,media_url}', limit: '100' };
+    if (after) params.after = after;
+    return metaRequest(`${base}/${account.id}/media`, { token, params, timeout: 12_000 });
+  }});
+}
+async function runYtDlp(id, url) {
+  const args = ['--ignore-config', '--no-playlist', '--max-downloads', '1', '--max-filesize', '250M',
+    '--no-progress', '--no-write-thumbnail', '--no-write-info-json',
+    '--socket-timeout', '20', '--retries', '2', '--fragment-retries', '2', '--merge-output-format', 'mp4',
+    '-P', DOWNLOAD_DIR, '-o', `${id}.%(ext)s`, url];
+  await new Promise((resolve, reject) => {
+    const child = spawn(YT_DLP, args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '', stopped = false;
+    child.stdout.on('data', () => {});
+    child.stderr.on('data', d => { stderr = (stderr + d.toString()).slice(-6000); });
+    child.on('error', e => { stopped = true; reject(new Error(e.code === 'ENOENT' ? 'yt-dlp is not installed. Install it or use Docker.' : e.message)); });
+    const timer = setInterval(async () => {
+      if (stopped) return;
+      try {
+        const names = (await fsp.readdir(DOWNLOAD_DIR)).filter(n => n.startsWith(`${id}.`));
+        let bytes = 0;
+        for (const n of names) bytes += (await fsp.stat(path.join(DOWNLOAD_DIR, n))).size;
+        if (bytes > MAX_DOWNLOAD) { stopped = true; child.kill('SIGKILL'); reject(new Error('Video exceeds 250 MB download limit.')); }
+      } catch { /* File may be moving while downloading */ }
+    }, 1500);
+    const timeout = setTimeout(() => { if (!stopped) { stopped = true; child.kill('SIGKILL'); reject(new Error('Download timed out after 5 minutes.')); } }, 300_000);
+    child.on('close', code => {
+      clearInterval(timer); clearTimeout(timeout);
+      if (stopped) return;
+      stopped = true;
+      code === 0 ? resolve() : reject(new Error(classifyExtractorFailure(stderr, code)));
+      if (code !== 0) console.warn(`[yt-dlp] download ${id} failed, exit ${code}: ${stderr.slice(-1500).replace(/(?:access_token|token|cookie|authorization)=\S+/gi,'[redacted]')}`);
+    });
+  });
+}
 let activeDownloads = 0;
 async function runDownloader(id, url) {
   activeDownloads++;
   db.prepare("UPDATE downloads SET status='downloading', updated_at=? WHERE id=?").run(isoNow(), id);
   try {
-    const args = ['--ignore-config', '--no-playlist', '--max-downloads', '1', '--max-filesize', '250M',
-      '--no-progress', '--no-warnings', '--no-write-thumbnail', '--no-write-info-json',
-      '--socket-timeout', '20', '--retries', '2', '--fragment-retries', '2', '--merge-output-format', 'mp4',
-      '-P', DOWNLOAD_DIR, '-o', `${id}.%(ext)s`, '--print', 'after_move:filepath', url];
-    await new Promise((resolve, reject) => {
-      const child = spawn(YT_DLP, args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
-      let stderr = '', stopped = false;
-      child.stdout.on('data', () => {});
-      child.stderr.on('data', d => { stderr = (stderr + d.toString()).slice(-3000); });
-      child.on('error', e => { stopped = true; reject(new Error(e.code === 'ENOENT' ? 'yt-dlp is not installed. Install it or use Docker.' : e.message)); });
-      const timer = setInterval(async () => {
-        if (stopped) return;
-        try {
-          const names = (await fsp.readdir(DOWNLOAD_DIR)).filter(n => n.startsWith(`${id}.`));
-          let bytes = 0;
-          for (const n of names) bytes += (await fsp.stat(path.join(DOWNLOAD_DIR, n))).size;
-          if (bytes > MAX_DOWNLOAD) { stopped = true; child.kill('SIGKILL'); reject(new Error('Video exceeds 250 MB download limit.')); }
-        } catch { /* File may be moving while downloading */ }
-      }, 1500);
-      const timeout = setTimeout(() => { if (!stopped) { stopped = true; child.kill('SIGKILL'); reject(new Error('Download timed out after 5 minutes.')); } }, 300_000);
-      child.on('close', code => {
-        clearInterval(timer); clearTimeout(timeout);
-        if (stopped) return;
-        stopped = true;
-        code === 0 ? resolve() : reject(new Error((stderr.trim() || `yt-dlp exited with status ${code}`).slice(-700)));
-      });
+    let sourceMethod = 'yt-dlp';
+    // The Graph API can resolve a user's own media more reliably than scraping
+    // an Instagram webpage from a Railway cloud IP.
+    const authorized = await findAuthorizedVideo(url).catch(e => {
+      console.warn(`[download] Meta media lookup unavailable: ${String(e.message).slice(0, 180)}`);
+      return null;
     });
+    if (authorized) {
+      try {
+        await streamOwnedVideo(authorized.url, path.join(DOWNLOAD_DIR, `${id}.mp4`), { maxBytes: MAX_DOWNLOAD });
+        sourceMethod = 'meta';
+      } catch (error) {
+        // A transient CDN failure can fall back to the regular public extractor.
+        console.warn(`[download] Meta media copy failed: ${String(error.message).slice(0, 180)}`);
+        await fsp.rm(path.join(DOWNLOAD_DIR, `${id}.mp4`), { force: true });
+        await runYtDlp(id, url);
+      }
+    } else {
+      await runYtDlp(id, url);
+    }
     const files = (await fsp.readdir(DOWNLOAD_DIR)).filter(n => n.startsWith(`${id}.`) && !/\.(?:part|ytdl|temp)$/.test(n));
     if (files.length !== 1) throw new Error('Could not locate a single downloaded video.');
     const size = (await fsp.stat(path.join(DOWNLOAD_DIR, files[0]))).size;
     if (!size || size > MAX_DOWNLOAD) throw new Error('Download is empty or exceeds the size limit.');
-    db.prepare("UPDATE downloads SET status='ready', filename=?, last_error=NULL, updated_at=? WHERE id=?").run(files[0], isoNow(), id);
+    db.prepare("UPDATE downloads SET status='ready', filename=?, source_method=?, last_error=NULL, updated_at=? WHERE id=?").run(files[0], sourceMethod, isoNow(), id);
   } catch (e) {
     const files = (await fsp.readdir(DOWNLOAD_DIR)).filter(n => n.startsWith(`${id}.`));
     for (const f of files) await fsp.rm(path.join(DOWNLOAD_DIR, f), { force: true }).catch(() => {});
@@ -424,7 +462,7 @@ function postsList({ limit = 200, status } = {}) {
   if (status && ['scheduled','processing','publishing','published','failed','canceled','needs_review'].includes(status)) return db.prepare(`${postsQuery} WHERE p.status=? ORDER BY p.scheduled_at DESC LIMIT ?`).all(status, limit).map(publicPost);
   return db.prepare(`${postsQuery} ORDER BY p.scheduled_at DESC LIMIT ?`).all(limit).map(publicPost);
 }
-function downloadsList() { return db.prepare('SELECT id, source_url AS sourceUrl, status, filename, last_error AS lastError, created_at AS createdAt FROM downloads ORDER BY created_at DESC LIMIT 40').all(); }
+function downloadsList() { return db.prepare('SELECT id, source_url AS sourceUrl, status, filename, last_error AS lastError, created_at AS createdAt, source_method AS sourceMethod FROM downloads ORDER BY created_at DESC LIMIT 40').all(); }
 const attemptsByIp = new Map();
 function checkLoginAttempts(req) {
   const ip = req.socket.remoteAddress || 'unknown';

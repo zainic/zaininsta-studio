@@ -31,12 +31,15 @@ test('self-hosted dashboard API: login, upload, schedule, cancel and disconnect'
   const tmp=await fs.mkdtemp(path.join(os.tmpdir(),'instagram-studio-test-'));
   await fs.copyFile(path.join(root,'server.js'),path.join(tmp,'server.js'));
   await fs.copyFile(path.join(root,'sqlite-driver.mjs'),path.join(tmp,'sqlite-driver.mjs'));
+  await fs.copyFile(path.join(root,'download-helper.mjs'),path.join(tmp,'download-helper.mjs'));
   // Native dependencies are installed at the project root; the isolated
   // test server needs access to the same installation on Node.js 20.
   try { await fs.symlink(path.join(root,'node_modules'),path.join(tmp,'node_modules'),'dir'); } catch (error) { if (error.code !== 'ENOENT' && error.code !== 'EEXIST') throw error; }
   await fs.copyFile(path.join(root,'package.json'),path.join(tmp,'package.json'));
   await fs.cp(path.join(root,'public'),path.join(tmp,'public'),{recursive:true});
-  const child=spawn(process.execPath,['server.js'], {cwd:tmp,env:{...process.env,PORT:String(port),APP_BASE_URL:base,PUBLIC_BASE_URL:'https://assets.studio.test',ADMIN_PASSWORD:'test-password-not-for-production',ENCRYPTION_KEY:encKey.toString('base64'),SESSION_SECRET:sessionSecret,GRAPH_VERSION:'v27.0'}, stdio:'ignore'});
+  const fakeDlp=path.join(tmp,'fake-yt-dlp');
+  await fs.writeFile(fakeDlp,'#!/usr/bin/env node\nconsole.error("ERROR: [Instagram] Requested content is not available, rate-limit reached or login required");process.exit(1);\n',{mode:0o755});
+  const child=spawn(process.execPath,['server.js'], {cwd:tmp,env:{...process.env,YT_DLP_BIN:fakeDlp,PORT:String(port),APP_BASE_URL:base,PUBLIC_BASE_URL:'https://assets.studio.test',ADMIN_PASSWORD:'test-password-not-for-production',ENCRYPTION_KEY:encKey.toString('base64'),SESSION_SECRET:sessionSecret,GRAPH_VERSION:'v27.0'}, stdio:'ignore'});
   t.after(async()=>{child.kill('SIGTERM');await new Promise(r=>setTimeout(r,200));await fs.rm(tmp,{recursive:true,force:true,maxRetries:4,retryDelay:200});});
   await waitForReady(child);
   const health=await (await fetch(base+'/api/health')).json(); assert.equal(health.ok,true);
@@ -54,6 +57,20 @@ test('self-hosted dashboard API: login, upload, schedule, cancel and disconnect'
   assert.match(upload.url,/https:\/\/assets.studio.test\/media\/.*\.jpg$/);
   const localMedia=await fetch(base+'/media/'+upload.url.split('/').at(-1));assert.equal(localMedia.status,200);
   const invalidDownload=await request('/api/downloads','POST',{url:'https://private.example.com/video',confirmRights:true});assert.equal(invalidDownload.status,400);
+  const publicDownload=await request('/api/downloads','POST',{url:'https://www.instagram.com/reel/GOODTESTCODE/',confirmRights:true});
+  assert.equal(publicDownload.status,202);
+  const downloadId=(await publicDownload.json()).id;
+  let failedDownload;
+  for(let i=0;i<60;i++){
+    const downloads=(await (await request('/api/downloads')).json()).downloads;
+    failedDownload=downloads.find(d=>d.id===downloadId);
+    if(failedDownload?.status==='failed')break;
+    await new Promise(r=>setTimeout(r,50));
+  }
+  assert.equal(failedDownload?.status,'failed');
+  assert.match(failedDownload.lastError,/Instagram blocked/);
+  assert.equal(failedDownload.sourceMethod,null);
+
   const date=new Date(Date.now()+3600000).toISOString();
   const noAccount=await request('/api/posts','POST',{accountId:'1',kind:'image',mediaUrl:upload.url,caption:'Test!',mode:'scheduled',scheduledAt:date});assert.equal(noAccount.status,400);
   const db=new DatabaseSync(path.join(tmp,'data','studio.sqlite'));
