@@ -32,6 +32,8 @@ test('self-hosted dashboard API: login, upload, schedule, cancel and disconnect'
   await fs.copyFile(path.join(root,'server.js'),path.join(tmp,'server.js'));
   await fs.copyFile(path.join(root,'sqlite-driver.mjs'),path.join(tmp,'sqlite-driver.mjs'));
   await fs.copyFile(path.join(root,'download-helper.mjs'),path.join(tmp,'download-helper.mjs'));
+  await fs.copyFile(path.join(root,'video-editor.mjs'),path.join(tmp,'video-editor.mjs'));
+  await fs.copyFile(path.join(root,'render-resources.mjs'),path.join(tmp,'render-resources.mjs'));
   // Native dependencies are installed at the project root; the isolated
   // test server needs access to the same installation on Node.js 20.
   try { await fs.symlink(path.join(root,'node_modules'),path.join(tmp,'node_modules'),process.platform === 'win32' ? 'junction' : 'dir'); } catch (error) { if (error.code !== 'ENOENT' && error.code !== 'EEXIST') throw error; }
@@ -120,6 +122,70 @@ syncBuiltinESMExports();
     assert.equal((await fs.readdir(path.join(tmp,'data','downloads'))).some(name=>name.startsWith(failed.id+'.')),false);
   }
 
+
+  await t.test('clear downloads keeps Deleted history, removes files, and protects active jobs and other files', async () => {
+    const downloadDir=path.join(tmp,'data','downloads');
+    const fixtureDb=new DatabaseSync(path.join(tmp,'data','studio.sqlite'));
+    try {
+      const endpoint='/api/downloads/'+completed.id;
+      assert.equal((await fetch(base+endpoint,{method:'DELETE',headers:{Origin:base}})).status,401);
+      assert.equal((await request(endpoint,'DELETE',undefined,{Origin:'https://untrusted.example'})).status,403);
+      assert.equal((await request('/api/downloads/'+crypto.randomUUID(),'DELETE')).status,404);
+      const unrelated=completed.id+'x.mp4';
+      await fs.writeFile(path.join(downloadDir,unrelated),'keep');
+      await fs.writeFile(path.join(downloadDir,completed.id+'.mp4.part'),'partial');
+      assert.equal((await request(endpoint,'DELETE')).status,200);
+      assert.equal((await request(endpoint+'/file')).status,404);
+      const archived=fixtureDb.prepare('SELECT * FROM downloads WHERE id=?').get(completed.id);
+      assert.equal(archived.status,'deleted');
+      assert.equal(archived.filename,null);
+      assert.equal(archived.source_url,completed.sourceUrl);
+      assert.equal(archived.created_at,completed.createdAt);
+      assert.equal(archived.source_method,completed.sourceMethod);
+      assert.ok(Number.isFinite(Date.parse(archived.updated_at)));
+      assert.equal((await fs.readdir(downloadDir)).some(name=>name.startsWith(completed.id+'.')),false);
+      assert.equal(await fs.readFile(path.join(downloadDir,unrelated),'utf8'),'keep');
+      assert.equal((await fetch(base+'/media/'+upload.url.split('/').at(-1))).status,200);
+      assert.equal((await request(endpoint,'DELETE')).status,200);
+      assert.equal(fixtureDb.prepare('SELECT updated_at FROM downloads WHERE id=?').get(completed.id).updated_at,archived.updated_at);
+      const history=(await (await request('/api/downloads')).json()).downloads.find(d=>d.id===completed.id);
+      assert.equal(history.status,'deleted');
+      assert.equal(history.filename,null);
+      assert.equal(history.updatedAt,archived.updated_at);
+      assert.equal((await request(endpoint+'/file','GET',undefined,{Range:'bytes=0-15'})).status,404);
+
+      await fs.writeFile(path.join(downloadDir,failedDownload.id+'.mp4.part'),'leftover');
+      assert.equal((await request('/api/downloads/'+failedDownload.id,'DELETE')).status,200);
+      await assert.rejects(fs.stat(path.join(downloadDir,failedDownload.id+'.mp4.part')),{code:'ENOENT'});
+      const failedHistory=fixtureDb.prepare('SELECT status,last_error FROM downloads WHERE id=?').get(failedDownload.id);
+      assert.equal(failedHistory.status,'deleted');
+      assert.equal(failedHistory.last_error,failedDownload.lastError);
+
+      const insert=fixtureDb.prepare('INSERT INTO downloads (id,source_url,status,filename,created_at,updated_at) VALUES (?,?,?,?,?,?)');
+      const stamp=new Date().toISOString();
+      for(const status of ['queued','downloading']) {
+        const id=crypto.randomUUID(), name=id+'.mp4.part';
+        insert.run(id,'https://www.instagram.com/reel/ACTIVE/',status,null,stamp,stamp);
+        await fs.writeFile(path.join(downloadDir,name),'in progress');
+        assert.equal((await request('/api/downloads/'+id,'DELETE')).status,409);
+        assert.equal(fixtureDb.prepare('SELECT status FROM downloads WHERE id=?').get(id).status,status);
+        assert.equal(await fs.readFile(path.join(downloadDir,name),'utf8'),'in progress');
+      }
+      const missingId=crypto.randomUUID();
+      insert.run(missingId,'https://www.instagram.com/reel/MISSING/','ready',missingId+'.mp4',stamp,stamp);
+      assert.equal((await request('/api/downloads/'+missingId,'DELETE')).status,200);
+      assert.equal(fixtureDb.prepare('SELECT status FROM downloads WHERE id=?').get(missingId).status,'deleted');
+      const unsafeId=crypto.randomUUID();
+      insert.run(unsafeId,'https://www.instagram.com/reel/UNSAFE/','ready','../uploads/keep.mp4',stamp,stamp);
+      assert.equal((await request('/api/downloads/'+unsafeId,'DELETE')).status,400);
+      assert.ok(fixtureDb.prepare('SELECT id FROM downloads WHERE id=?').get(unsafeId));
+      const blockedId=crypto.randomUUID();
+      insert.run(blockedId,'https://www.instagram.com/reel/BLOCKED/','ready',blockedId+'.mp4',stamp,stamp);
+      await fs.mkdir(path.join(downloadDir,blockedId+'.mp4'));
+      assert.equal((await request('/api/downloads/'+blockedId,'DELETE')).status,503);
+      assert.equal(fixtureDb.prepare('SELECT status FROM downloads WHERE id=?').get(blockedId).status,'ready');
+    } finally { fixtureDb.close(); }
+  });
 
   const date=new Date(Date.now()+3600000).toISOString();
   const noAccount=await request('/api/posts','POST',{accountId:'1',kind:'image',mediaUrl:upload.url,caption:'Test!',mode:'scheduled',scheduledAt:date});assert.equal(noAccount.status,400);
